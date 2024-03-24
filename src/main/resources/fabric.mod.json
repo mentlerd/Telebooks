@@ -1,0 +1,26 @@
+{
+	"schemaVersion": 1,
+	"id": "telebooks",
+	"version": "${version}",
+	"name": "Teleport books",
+	"description": "Books a'la Huncraft",
+	"authors": [
+		"mentlerd"
+	],
+	"contact": {},
+	"license": "MIT",
+	"icon": "assets/telebooks/icon.png",
+	"environment": "*",
+	"entrypoints": {
+		"server": [
+			"com.mentlerd.Telebooks"
+		]
+	},
+	"depends": {
+		"fabricloader": ">=0.15.0",
+		"minecraft": "~1.20.4",
+		"java": ">=17",
+		"fabric-api": "*"
+	},
+	"suggests": {}
+}
