@@ -1,6 +1,5 @@
 package com.mentlerd;
 
-import com.google.common.collect.Lists;
 import com.mojang.serialization.Codec;
 import com.mojang.serialization.codecs.RecordCodecBuilder;
 import net.fabricmc.api.DedicatedServerModInitializer;
@@ -10,6 +9,7 @@ import net.fabricmc.fabric.api.event.player.UseBlockCallback;
 import net.minecraft.block.*;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityType;
+import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.nbt.*;
 import net.minecraft.registry.RegistryKey;
 import net.minecraft.server.MinecraftServer;
@@ -25,13 +25,12 @@ import net.minecraft.world.WorldAccess;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Objects;
+import java.util.*;
 
 public class Telebooks implements DedicatedServerModInitializer {
-	public static final Logger LOGGER = LoggerFactory.getLogger("telebooks");
+	public static final String MOD_ID = "telebooks";
+
+	public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
 
 	static Vec3d rotateOffset(Vec3d vec, BlockRotation rotation) {
 		return switch (rotation) {
@@ -219,6 +218,44 @@ public class Telebooks implements DedicatedServerModInitializer {
 		}
 	}
 
+	static Optional<List<BlockState>> tryGetBookPattern(World world, BlockPos center, Direction forward) {
+		var transformed = new TransformedWorld(world, center, forward);
+
+		final int patternRadius = 1;
+
+		// Requirement: valid patterns are surrounded by an obsidian frame
+		final int frameRadius = patternRadius + 1;
+		final var frameMaterial = Blocks.OBSIDIAN;
+
+		for (int off = -frameRadius; off < frameRadius; off++) {
+			if (!transformed.getBlockState(off, 0, +frameRadius).isOf(frameMaterial)) {
+				return Optional.empty();
+			}
+			if (!transformed.getBlockState(off, 0, -frameRadius).isOf(frameMaterial)) {
+				return Optional.empty();
+			}
+			if (!transformed.getBlockState(+frameRadius, 0, off).isOf(frameMaterial)) {
+				return Optional.empty();
+			}
+			if (!transformed.getBlockState(-frameRadius, 0, off).isOf(frameMaterial)) {
+				return Optional.empty();
+			}
+		}
+
+		// Actual pattern is parsed in the local coordinate system
+		var pattern = new ArrayList<BlockState>();
+
+		for (int offX = -1; offX <= 1; offX++) {
+			for (int offZ = -1; offZ <= 1; offZ++) {
+				var state = transformed.getBlockState(offX, 0, offZ);
+
+				pattern.add(state);
+			}
+		}
+
+		return Optional.of(pattern);
+	}
+
 	record BookLocation(RegistryKey<World> world, BlockPos center, Direction forward) {
 		static final Codec<BookLocation> CODEC = RecordCodecBuilder.create(instance ->
 				instance.group(
@@ -254,16 +291,19 @@ public class Telebooks implements DedicatedServerModInitializer {
 	}
 
 	static class State extends PersistentState {
-		private static Type<State> type = new Type<>(State::new, nbt -> {
+		private static final Type<State> type = new Type<>(State::new, nbt -> {
 			var value = new State();
 			value.readNbt(nbt);
 			return value;
 		}, null);
 
 		public static State get(MinecraftServer server) {
-			var overworld = Objects.requireNonNull(server.getWorld(World.OVERWORLD));
+			var world = Objects.requireNonNull(server.getWorld(World.OVERWORLD));
 
-			var state = overworld.getPersistentStateManager().getOrCreate(type, "telebooks.state");
+			var state = world.getPersistentStateManager().getOrCreate(type, MOD_ID);
+
+			// NB: Technically this is incorrect, but saving happens rather rarely, and it is much more
+			//  convenient to just assume that the state has changed.
 			state.markDirty();
 
 			return state;
@@ -313,17 +353,62 @@ public class Telebooks implements DedicatedServerModInitializer {
 		}
 	}
 
+	private ActionResult handleLecternUse(ServerWorld world, BlockPos pos) {
+		var forward = world.getBlockState(pos).get(LecternBlock.FACING);
+		var center = pos.offset(forward, 2).offset(Direction.DOWN);
+
+		// Check whether this lectern sits on top of a valid book pattern
+		var pattern = tryGetBookPattern(world, center, forward);
+		if (pattern.isEmpty()) {
+			return ActionResult.PASS;
+		}
+
+		// If so, locate corresponding book chain
+		var state = State.get(world.getServer());
+		var chain = state.getOrCreateBookChain(pattern.get());
+
+		// Check whether this book is a new joiner, and add them to the chain
+		{
+			var book = new BookLocation(world.getRegistryKey(), center, forward);
+
+			if (!chain.books.contains(book)) {
+				chain.books.add(book);
+			}
+		}
+
+		// Check target locations to see which ones still have the pattern intact
+		var targets = chain.books.stream().filter(loc -> {
+			var world2 = world.getServer().getWorld(loc.world);
+
+			var candidatePattern = tryGetBookPattern(world2, loc.center, loc.forward);
+			if (candidatePattern.isEmpty()) {
+				return false;
+			}
+
+			return pattern.equals(candidatePattern);
+		}).toList();
+
+		// We might not have enough books intact to perform teleportation
+		if (targets.size() <= 1) {
+			return ActionResult.CONSUME;
+		}
+
+		// Rotate contents of area immediately above valid targets
+		LOGGER.info("Will rotate: {}", targets);
+
+		return ActionResult.CONSUME;
+	}
+
 	@Override
 	public void onInitializeServer() {
-		UseBlockCallback.EVENT.register((player, eventWorld, hand, hitResult) -> {
-			var world = (ServerWorld) eventWorld;
-
+		UseBlockCallback.EVENT.register((player, world, hand, hitResult) -> {
 			if (player.isSpectator()) {
 				return ActionResult.PASS;
 			}
 			if (hand != Hand.MAIN_HAND || hitResult.getType() != HitResult.Type.BLOCK) {
 				return ActionResult.PASS;
 			}
+
 			var blockPos = hitResult.getBlockPos();
 			var blockState = world.getBlockState(blockPos);
 
@@ -331,87 +416,7 @@ public class Telebooks implements DedicatedServerModInitializer {
 				return ActionResult.PASS;
 			}
 
-			{
-				var state = State.get(world.getServer());
-
-				var forward = world.getBlockState(blockPos).get(LecternBlock.FACING);
-				var center = blockPos.offset(forward, 2).offset(Direction.DOWN);
-
-				var tworld = new TransformedWorld(world, center, forward);
-
-				var pattern = new ArrayList<BlockState>();
-
-				for (int offX = -1; offX <= 1; offX++) {
-					for (int offZ = -1; offZ <= 1; offZ++) {
-						pattern.add(tworld.getBlockState(offX, 0, offZ));
-					}
-				}
-
-				var chain = state.getOrCreateBookChain(pattern);
-
-				// Register self
-				if (chain.books.stream().noneMatch(loc -> loc.center.equals(center))) {
-					chain.books.add(new BookLocation(world.getRegistryKey(), center, forward));
-				}
-
-				// Sanitize chain
-				var server = world.getServer();
-
-				var targets = chain.books.stream().filter(loc -> {
-					var world2 = server.getWorld(loc.world);
-					if (world2 == null) {
-						return false;
-					}
-
-					var tworld2 = new TransformedWorld(world2, loc.center, loc.forward);
-
-					var pattern2 = new ArrayList<BlockState>();
-
-					for (int offX = -1; offX <= 1; offX++) {
-						for (int offZ = -1; offZ <= 1; offZ++) {
-							pattern2.add(tworld2.getBlockState(offX, 0, offZ));
-						}
-					}
-
-					return pattern.equals(pattern2);
-				}).toList();
-
-				LOGGER.info("Would rotate: {}", targets);
-			}
-
-			var lecterns = Lists.newArrayList(
-					new BlockPos(-36, -60, -1),
-					new BlockPos(-42, -60, -1),
-					new BlockPos(-46, -60, 3),
-					new BlockPos(-46, -60, 9),
-					new BlockPos(-42, -60, 13),
-					new BlockPos(-36, -60, 13),
-					new BlockPos(-32, -60, 9),
-					new BlockPos(-32, -60, 3)
-			);
-
-			var mins = new Vec3i(-1, -1, -1);
-			var maxs = new Vec3i(1, 1, 1);
-
-			VolumeSnapshot prev = null;
-
-			for (int index = 0; index <= lecterns.size(); index++) {
-				var lectern = lecterns.get(index % lecterns.size());
-
-				var forward = world.getBlockState(lectern).get(LecternBlock.FACING);
-				var center = lectern.offset(forward, 2).offset(Direction.UP);
-
-				var snapshot = new VolumeSnapshot();
-				snapshot.copy(world, center, mins, maxs, forward);
-
-				if (prev != null) {
-					prev.paste(world, center, forward);
-				}
-
-				prev = snapshot;
-			}
-
-			return ActionResult.PASS;
+			return handleLecternUse((ServerWorld) world, blockPos);
 		});
 	}
 }
