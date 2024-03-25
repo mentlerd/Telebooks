@@ -1,34 +1,37 @@
 package com.mentlerd;
 
 import com.google.common.collect.Lists;
+import com.mojang.serialization.Codec;
+import com.mojang.serialization.codecs.RecordCodecBuilder;
 import net.fabricmc.api.DedicatedServerModInitializer;
 
 import net.fabricmc.fabric.api.event.player.UseBlockCallback;
 
-import net.minecraft.block.Block;
-import net.minecraft.block.BlockState;
-import net.minecraft.block.Blocks;
-import net.minecraft.block.LecternBlock;
+import net.minecraft.block.*;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityType;
-import net.minecraft.nbt.NbtCompound;
-import net.minecraft.nbt.NbtDouble;
-import net.minecraft.nbt.NbtList;
+import net.minecraft.nbt.*;
+import net.minecraft.registry.RegistryKey;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.*;
+import net.minecraft.util.dynamic.Codecs;
 import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.*;
+import net.minecraft.world.PersistentState;
+import net.minecraft.world.World;
 import net.minecraft.world.WorldAccess;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Objects;
 
 public class Telebooks implements DedicatedServerModInitializer {
 	public static final Logger LOGGER = LoggerFactory.getLogger("telebooks");
-
-	static final float PI_P2 = (float) Math.PI / 2.0f;
 
 	static Vec3d rotateOffset(Vec3d vec, BlockRotation rotation) {
 		return switch (rotation) {
@@ -175,6 +178,134 @@ public class Telebooks implements DedicatedServerModInitializer {
 		}
 	}
 
+	static class TransformedWorld {
+		private final World world;
+		private final BlockPos origin;
+
+		private final BlockRotation rotationInto;
+		private final BlockRotation rotationFrom;
+
+		public TransformedWorld(World world, BlockPos origin, Direction forward) {
+			this.world = world;
+			this.origin = origin;
+
+			this.rotationInto = switch (forward) {
+				case UP, DOWN -> throw new IllegalArgumentException();
+
+				case EAST -> BlockRotation.NONE;
+				case SOUTH -> BlockRotation.COUNTERCLOCKWISE_90;
+				case WEST -> BlockRotation.CLOCKWISE_180;
+				case NORTH -> BlockRotation.CLOCKWISE_90;
+			};
+			this.rotationFrom = switch (forward) {
+				case UP, DOWN -> throw new IllegalArgumentException();
+
+				case EAST -> BlockRotation.NONE;
+				case SOUTH -> BlockRotation.CLOCKWISE_90;
+				case WEST -> BlockRotation.CLOCKWISE_180;
+				case NORTH -> BlockRotation.COUNTERCLOCKWISE_90;
+			};
+		}
+
+		private BlockPos localToGlobal(BlockPos pos) {
+			return pos.rotate(rotationFrom).add(origin);
+		}
+
+		public BlockState getBlockState(BlockPos pos) {
+			return world.getBlockState(localToGlobal(pos)).rotate(rotationInto);
+		}
+		public BlockState getBlockState(int x, int y, int z) {
+			return getBlockState(new BlockPos(x, y, z));
+		}
+	}
+
+	record BookLocation(RegistryKey<World> world, BlockPos position) {
+		static final Codec<BookLocation> CODEC = RecordCodecBuilder.create(instance ->
+				instance.group(
+						World.CODEC.fieldOf("world").forGetter(BookLocation::world),
+						BlockPos.CODEC.fieldOf("position").forGetter(BookLocation::position)
+				).apply(instance, BookLocation::new)
+		);
+	}
+	record BookChain(int id, List<BlockState> pattern, List<BookLocation> books) {
+		static final Codec<BookChain> CODEC = RecordCodecBuilder.create(instance ->
+				instance.group(
+						Codecs.NONNEGATIVE_INT.fieldOf("id").forGetter(BookChain::id),
+						BlockState.CODEC.listOf().fieldOf("pattern").forGetter(BookChain::pattern),
+						BookLocation.CODEC.listOf().fieldOf("books").forGetter(BookChain::books)
+				).apply(instance, BookChain::new)
+		);
+
+		public BookChain(int id) {
+			this(id, new ArrayList<>(), new ArrayList<>());
+		}
+	}
+	record Database(List<BookChain> books) {
+		static final Codec<Database> CODEC = RecordCodecBuilder.create(instance ->
+			instance.group(
+					BookChain.CODEC.listOf().fieldOf("chains").forGetter(Database::books)
+			).apply(instance, Database::new)
+		);
+	}
+
+	static class State extends PersistentState {
+		private static Type<State> type = new Type<>(State::new, nbt -> {
+			var value = new State();
+			value.readNbt(nbt);
+			return value;
+		}, null);
+
+		public static State get(MinecraftServer server) {
+			var overworld = Objects.requireNonNull(server.getWorld(World.OVERWORLD));
+
+			var state = overworld.getPersistentStateManager().getOrCreate(type, "telebooks.state");
+			state.markDirty();
+
+			return state;
+		}
+
+		Database database = new Database(new ArrayList<>());
+
+		int nextChainID = 0;
+
+		final HashMap<Integer, BookChain> books = new HashMap<>();
+		final HashMap<List<BlockState>, Integer> patternToBook = new HashMap<>();
+
+		public void readNbt(NbtCompound nbt) {
+			database = Database.CODEC.parse(NbtOps.INSTANCE, nbt).resultOrPartial(LOGGER::error).orElseThrow();
+
+			nextChainID = 0;
+			books.clear();
+			patternToBook.clear();
+
+			for (var book : database.books) {
+				nextChainID = Math.max(nextChainID, book.id + 1);
+				books.put(book.id, book);
+				patternToBook.put(book.pattern, book.id);
+			}
+		}
+
+		@Override
+		public NbtCompound writeNbt(NbtCompound nbt) {
+			return (NbtCompound) Database.CODEC.encodeStart(NbtOps.INSTANCE, database).resultOrPartial(LOGGER::error).orElseThrow();
+		}
+
+		public BookChain getOrCreateBookChain(List<BlockState> pattern) {
+			var existingID = patternToBook.get(pattern);
+			if (existingID == null) {
+				var id = nextChainID++;
+				var chain = new BookChain(id);
+
+				books.put(id, chain);
+				patternToBook.put(pattern, id);
+
+				return chain;
+			}
+
+			return books.get(existingID);
+		}
+	}
+
 	@Override
 	public void onInitializeServer() {
 		UseBlockCallback.EVENT.register((player, eventWorld, hand, hitResult) -> {
@@ -191,6 +322,27 @@ public class Telebooks implements DedicatedServerModInitializer {
 
 			if (!blockState.isOf(Blocks.LECTERN)) {
 				return ActionResult.PASS;
+			}
+
+			{
+				var state = State.get(world.getServer());
+
+				var forward = world.getBlockState(blockPos).get(LecternBlock.FACING);
+				var center = blockPos.offset(forward, 2).offset(Direction.DOWN);
+
+				var tworld = new TransformedWorld(world, center, forward);
+
+				var pattern = new ArrayList<BlockState>();
+
+				for (int offX = -1; offX <= 1; offX++) {
+					for (int offZ = -1; offZ <= 1; offZ++) {
+						pattern.add(tworld.getBlockState(offX, 0, offZ));
+					}
+				}
+
+				var chain = state.getOrCreateBookChain(pattern);
+
+				LOGGER.info("{}", chain);
 			}
 
 			var lecterns = Lists.newArrayList(
