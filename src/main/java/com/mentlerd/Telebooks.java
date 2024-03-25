@@ -219,11 +219,12 @@ public class Telebooks implements DedicatedServerModInitializer {
 		}
 	}
 
-	record BookLocation(RegistryKey<World> world, BlockPos position) {
+	record BookLocation(RegistryKey<World> world, BlockPos center, Direction forward) {
 		static final Codec<BookLocation> CODEC = RecordCodecBuilder.create(instance ->
 				instance.group(
 						World.CODEC.fieldOf("world").forGetter(BookLocation::world),
-						BlockPos.CODEC.fieldOf("position").forGetter(BookLocation::position)
+						BlockPos.CODEC.fieldOf("center").forGetter(BookLocation::center),
+						Direction.CODEC.fieldOf("forward").forGetter(BookLocation::forward)
 				).apply(instance, BookLocation::new)
 		);
 	}
@@ -236,8 +237,8 @@ public class Telebooks implements DedicatedServerModInitializer {
 				).apply(instance, BookChain::new)
 		);
 
-		public BookChain(int id) {
-			this(id, new ArrayList<>(), new ArrayList<>());
+		public BookChain(int id, List<BlockState> pattern) {
+			this(id, pattern, new ArrayList<>());
 		}
 	}
 	record Database(List<BookChain> books) {
@@ -246,6 +247,10 @@ public class Telebooks implements DedicatedServerModInitializer {
 					BookChain.CODEC.listOf().fieldOf("chains").forGetter(Database::books)
 			).apply(instance, Database::new)
 		);
+
+		public Database() {
+			this(new ArrayList<>());
+		}
 	}
 
 	static class State extends PersistentState {
@@ -264,15 +269,13 @@ public class Telebooks implements DedicatedServerModInitializer {
 			return state;
 		}
 
-		Database database = new Database(new ArrayList<>());
-
 		int nextChainID = 0;
 
 		final HashMap<Integer, BookChain> books = new HashMap<>();
 		final HashMap<List<BlockState>, Integer> patternToBook = new HashMap<>();
 
 		public void readNbt(NbtCompound nbt) {
-			database = Database.CODEC.parse(NbtOps.INSTANCE, nbt).resultOrPartial(LOGGER::error).orElseThrow();
+			var database = Database.CODEC.parse(NbtOps.INSTANCE, nbt).resultOrPartial(LOGGER::error).orElseThrow();
 
 			nextChainID = 0;
 			books.clear();
@@ -287,6 +290,10 @@ public class Telebooks implements DedicatedServerModInitializer {
 
 		@Override
 		public NbtCompound writeNbt(NbtCompound nbt) {
+			var database = new Database();
+
+            database.books.addAll(books.values());
+
 			return (NbtCompound) Database.CODEC.encodeStart(NbtOps.INSTANCE, database).resultOrPartial(LOGGER::error).orElseThrow();
 		}
 
@@ -294,7 +301,7 @@ public class Telebooks implements DedicatedServerModInitializer {
 			var existingID = patternToBook.get(pattern);
 			if (existingID == null) {
 				var id = nextChainID++;
-				var chain = new BookChain(id);
+				var chain = new BookChain(id, pattern);
 
 				books.put(id, chain);
 				patternToBook.put(pattern, id);
@@ -342,7 +349,34 @@ public class Telebooks implements DedicatedServerModInitializer {
 
 				var chain = state.getOrCreateBookChain(pattern);
 
-				LOGGER.info("{}", chain);
+				// Register self
+				if (chain.books.stream().noneMatch(loc -> loc.center.equals(center))) {
+					chain.books.add(new BookLocation(world.getRegistryKey(), center, forward));
+				}
+
+				// Sanitize chain
+				var server = world.getServer();
+
+				var targets = chain.books.stream().filter(loc -> {
+					var world2 = server.getWorld(loc.world);
+					if (world2 == null) {
+						return false;
+					}
+
+					var tworld2 = new TransformedWorld(world2, loc.center, loc.forward);
+
+					var pattern2 = new ArrayList<BlockState>();
+
+					for (int offX = -1; offX <= 1; offX++) {
+						for (int offZ = -1; offZ <= 1; offZ++) {
+							pattern2.add(tworld2.getBlockState(offX, 0, offZ));
+						}
+					}
+
+					return pattern.equals(pattern2);
+				}).toList();
+
+				LOGGER.info("Would rotate: {}", targets);
 			}
 
 			var lecterns = Lists.newArrayList(
