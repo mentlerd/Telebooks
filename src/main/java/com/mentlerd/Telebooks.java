@@ -9,17 +9,15 @@ import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.block.LecternBlock;
+import net.minecraft.entity.Entity;
+import net.minecraft.entity.EntityType;
 import net.minecraft.nbt.NbtCompound;
-import net.minecraft.util.ActionResult;
-import net.minecraft.util.BlockRotation;
-import net.minecraft.util.Clearable;
-import net.minecraft.util.Hand;
+import net.minecraft.nbt.NbtDouble;
+import net.minecraft.nbt.NbtList;
+import net.minecraft.server.world.ServerWorld;
+import net.minecraft.util.*;
 import net.minecraft.util.hit.HitResult;
-import net.minecraft.util.math.BlockPos;
-import net.minecraft.util.math.Direction;
-import net.minecraft.util.math.Vec3i;
-import net.minecraft.world.ModifiableWorld;
-import net.minecraft.world.World;
+import net.minecraft.util.math.*;
 import net.minecraft.world.WorldAccess;
 
 import org.slf4j.Logger;
@@ -30,14 +28,31 @@ import java.util.ArrayList;
 public class Telebooks implements DedicatedServerModInitializer {
 	public static final Logger LOGGER = LoggerFactory.getLogger("telebooks");
 
+	static final float PI_P2 = (float) Math.PI / 2.0f;
+
+	static Vec3d rotateOffset(Vec3d vec, BlockRotation rotation) {
+		return switch (rotation) {
+			case NONE -> vec;
+			case CLOCKWISE_90 -> new Vec3d(-vec.getZ(), vec.getY(), vec.getX());
+			case CLOCKWISE_180 -> new Vec3d(-vec.getX(), vec.getY(), -vec.getZ());
+			case COUNTERCLOCKWISE_90 -> new Vec3d(vec.getZ(), vec.getY(), -vec.getX());
+		};
+	}
+
 	static class VolumeSnapshot {
 		static class BlockInfo {
 			public Vec3i offset;
 			public BlockState state;
 			public NbtCompound blockEntityData;
 		}
+		static class EntityInfo {
+			public Vec3d offset;
+			public EntityType<?> type;
+			public NbtCompound entityData;
+		}
 
 		private final ArrayList<BlockInfo> blocks = new ArrayList<>();
+		private final ArrayList<EntityInfo> entities = new ArrayList<>();
 
 		public void copy(WorldAccess world, BlockPos center, Vec3i mins, Vec3i maxs, Direction forward) {
 			var right = forward.rotateYClockwise();
@@ -45,10 +60,10 @@ public class Telebooks implements DedicatedServerModInitializer {
 			var rotation = switch (forward) {
 				case UP, DOWN -> throw new IllegalArgumentException();
 
-				case NORTH -> BlockRotation.NONE;
-				case EAST -> BlockRotation.COUNTERCLOCKWISE_90;
-				case SOUTH -> BlockRotation.CLOCKWISE_180;
-				case WEST -> BlockRotation.CLOCKWISE_90;
+				case EAST -> BlockRotation.NONE;
+				case SOUTH -> BlockRotation.COUNTERCLOCKWISE_90;
+				case WEST -> BlockRotation.CLOCKWISE_180;
+				case NORTH -> BlockRotation.CLOCKWISE_90;
 			};
 
 			for (int offX = mins.getX(); offX <= maxs.getX(); offX++) {
@@ -73,18 +88,46 @@ public class Telebooks implements DedicatedServerModInitializer {
 					}
 				}
 			}
+
+			var centerPos = center.toCenterPos();
+
+			var entityBox = new Box(
+				centerPos.add(mins.getX(), mins.getY(), mins.getZ()),
+				centerPos.add(maxs.getX(), maxs.getY(), maxs.getZ())
+			);
+
+			for (var entity : world.getNonSpectatingEntities(Entity.class, entityBox)) {
+				var type = entity.getType();
+
+				if (!type.isSaveable() || !type.isSummonable()) {
+					continue;
+				}
+
+				var info = new EntityInfo();
+
+				info.offset = rotateOffset(entity.getPos().subtract(centerPos), rotation);
+				info.type = type;
+				info.entityData = new NbtCompound();
+
+				if (!entity.saveNbt(info.entityData)) {
+					LOGGER.warn("Failed to copy entity");
+					continue;
+				}
+
+				entities.add(info);
+			}
 		}
 
-		public void paste(World world, BlockPos center, Direction forward) {
+		public void paste(ServerWorld world, BlockPos center, Direction forward) {
 			var right = forward.rotateYClockwise();
 
 			var rotation = switch (forward) {
 				case UP, DOWN -> throw new IllegalArgumentException();
 
-				case NORTH -> BlockRotation.NONE;
-				case EAST -> BlockRotation.CLOCKWISE_90;
-				case SOUTH -> BlockRotation.CLOCKWISE_180;
-				case WEST -> BlockRotation.COUNTERCLOCKWISE_90;
+				case EAST -> BlockRotation.NONE;
+				case SOUTH -> BlockRotation.CLOCKWISE_90;
+				case WEST -> BlockRotation.CLOCKWISE_180;
+				case NORTH -> BlockRotation.COUNTERCLOCKWISE_90;
 			};
 
 			for (var info : blocks) {
@@ -108,12 +151,35 @@ public class Telebooks implements DedicatedServerModInitializer {
 					blockEntity.markDirty();
 				}
 			}
+
+			var centerPos = center.toCenterPos();
+
+			for (var info : entities) {
+				var pos = centerPos.add(rotateOffset(info.offset, rotation));
+
+				var posList = new NbtList();
+				posList.add(NbtDouble.of(pos.getX()));
+				posList.add(NbtDouble.of(pos.getY()));
+				posList.add(NbtDouble.of(pos.getZ()));
+
+				var spawnData = info.entityData.copy();
+				spawnData.put("Pos", posList);
+				spawnData.remove("UUID");
+
+				EntityType.getEntityFromNbt(spawnData, world).ifPresent(entity -> {
+					entity.refreshPositionAndAngles(pos.getX(), pos.getY(), pos.getZ(), entity.getYaw() + entity.applyRotation(rotation), entity.getPitch());
+
+					world.spawnEntityAndPassengers(entity);
+				});
+			}
 		}
 	}
 
 	@Override
 	public void onInitializeServer() {
-		UseBlockCallback.EVENT.register((player, world, hand, hitResult) -> {
+		UseBlockCallback.EVENT.register((player, eventWorld, hand, hitResult) -> {
+			var world = (ServerWorld) eventWorld;
+
 			if (player.isSpectator()) {
 				return ActionResult.PASS;
 			}
