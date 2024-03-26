@@ -7,10 +7,12 @@ import net.fabricmc.api.DedicatedServerModInitializer;
 import net.fabricmc.fabric.api.event.player.UseBlockCallback;
 
 import net.minecraft.block.*;
+import net.minecraft.block.entity.BlockEntityType;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityType;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.nbt.*;
+import net.minecraft.network.packet.s2c.play.PositionFlag;
 import net.minecraft.registry.RegistryKey;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.world.ServerWorld;
@@ -19,6 +21,7 @@ import net.minecraft.util.dynamic.Codecs;
 import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.*;
 import net.minecraft.world.PersistentState;
+import net.minecraft.world.PersistentStateManager;
 import net.minecraft.world.World;
 import net.minecraft.world.WorldAccess;
 
@@ -27,6 +30,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.*;
 
+@SuppressWarnings("unused")
 public class Telebooks implements DedicatedServerModInitializer {
 	public static final String MOD_ID = "telebooks";
 
@@ -40,24 +44,29 @@ public class Telebooks implements DedicatedServerModInitializer {
 			case COUNTERCLOCKWISE_90 -> new Vec3d(vec.getZ(), vec.getY(), -vec.getX());
 		};
 	}
+	static float rotateYaw(float yaw, BlockRotation rotation) {
+		return switch (rotation) {
+			case NONE -> yaw;
+			case CLOCKWISE_90 -> yaw + 90.0F;
+			case CLOCKWISE_180 -> yaw + 180.0F;
+			case COUNTERCLOCKWISE_90 -> yaw + 270.0F;
+		};
+	}
 
-	static class VolumeSnapshot {
-		static class BlockInfo {
-			public Vec3i offset;
-			public BlockState state;
-			public NbtCompound blockEntityData;
-		}
-		static class EntityInfo {
-			public Vec3d offset;
-			public EntityType<?> type;
-			public NbtCompound entityData;
-		}
+	static class TeleportVolume {
+		record BlockInfo(Vec3i offset, BlockState state, NbtCompound blockEntityData) {}
+		record EntityInfo(Vec3d offset, EntityType<?> type, NbtCompound entityData) {}
+		record PlayerInfo(Vec3d offset, float yaw, PlayerEntity player) {}
 
 		private final ArrayList<BlockInfo> blocks = new ArrayList<>();
 		private final ArrayList<EntityInfo> entities = new ArrayList<>();
+		private final ArrayList<PlayerInfo> players = new ArrayList<>();
 
-		public void copy(WorldAccess world, BlockPos center, Vec3i mins, Vec3i maxs, Direction forward) {
+		public void cut(WorldAccess world, BlockPos center, Direction forward) {
 			var right = forward.rotateYClockwise();
+
+			var mins = new Vec3i(-1, 1, -1);
+			var maxs = new Vec3i(1, 4, 1);
 
 			var rotation = switch (forward) {
 				case UP, DOWN -> throw new IllegalArgumentException();
@@ -76,17 +85,24 @@ public class Telebooks implements DedicatedServerModInitializer {
 								.offset(Direction.UP, offY)
 								.offset(right, offZ);
 
-						var info = new BlockInfo();
+						var offset = new Vec3i(offX, offY, offZ);
+						var state = world.getBlockState(pos).rotate(rotation);
 
-						info.offset = new Vec3i(offX, offY, offZ);
-						info.state = world.getBlockState(pos).rotate(rotation);
+						NbtCompound blockEntityData = null;
 
 						var blockEntity = world.getBlockEntity(pos);
 						if (blockEntity != null) {
-							info.blockEntityData = blockEntity.createNbt();
+							blockEntityData = blockEntity.createNbt();
+
+							// Clear inventories of block entities before changing them
+							//  to air, otherwise they would drop their contents
+							Clearable.clear(blockEntity);
 						}
 
-						blocks.add(info);
+						blocks.add(new BlockInfo(offset, state, blockEntityData));
+
+						// Remove snapshot block
+						world.setBlockState(pos, Blocks.AIR.getDefaultState(), Block.NOTIFY_LISTENERS);
 					}
 				}
 			}
@@ -99,24 +115,34 @@ public class Telebooks implements DedicatedServerModInitializer {
 			);
 
 			for (var entity : world.getNonSpectatingEntities(Entity.class, entityBox)) {
+				var offset = rotateOffset(entity.getPos().subtract(centerPos), rotation);
+
+				// Players are an exception, they are truly transferred instead of being copied
+				if (entity.isPlayer()) {
+					var player = (PlayerEntity) entity;
+					var yaw = rotateYaw(player.getYaw(), rotation);
+
+					players.add(new PlayerInfo(offset, yaw, player));
+					continue;
+				}
+
 				var type = entity.getType();
 
 				if (!type.isSaveable() || !type.isSummonable()) {
 					continue;
 				}
 
-				var info = new EntityInfo();
+				var entityData = new NbtCompound();
 
-				info.offset = rotateOffset(entity.getPos().subtract(centerPos), rotation);
-				info.type = type;
-				info.entityData = new NbtCompound();
-
-				if (!entity.saveNbt(info.entityData)) {
+				if (!entity.saveNbt(entityData)) {
 					LOGGER.warn("Failed to copy entity");
 					continue;
 				}
 
-				entities.add(info);
+				entities.add(new EntityInfo(offset, type, entityData));
+
+				// Remove snapshot entity
+				entity.remove(Entity.RemovalReason.CHANGED_DIMENSION);
 			}
 		}
 
@@ -174,6 +200,17 @@ public class Telebooks implements DedicatedServerModInitializer {
 					world.spawnEntityAndPassengers(entity);
 				});
 			}
+
+			var playerPosFlags = EnumSet.noneOf(PositionFlag.class);
+
+			for (var info : players) {
+				var pos = centerPos.add(rotateOffset(info.offset, rotation));
+				var yaw = rotateYaw(info.yaw, rotation);
+
+				var player = info.player;
+
+				player.teleport(world, pos.x, pos.y, pos.z, playerPosFlags, yaw, player.getPitch());
+			}
 		}
 	}
 
@@ -206,8 +243,11 @@ public class Telebooks implements DedicatedServerModInitializer {
 			};
 		}
 
-		private BlockPos localToGlobal(BlockPos pos) {
+		public BlockPos localToGlobal(BlockPos pos) {
 			return pos.rotate(rotationFrom).add(origin);
+		}
+		public BlockPos localToGlobal(int x, int y, int z) {
+			return localToGlobal(new BlockPos(x, y, z));
 		}
 
 		public BlockState getBlockState(BlockPos pos) {
@@ -249,6 +289,13 @@ public class Telebooks implements DedicatedServerModInitializer {
 			for (int offZ = -1; offZ <= 1; offZ++) {
 				var state = transformed.getBlockState(offX, 0, offZ);
 
+				// Requirement: patterns must be made of blocks which have a solid top surface to stand on
+				var shape = state.getCollisionShape(world, transformed.localToGlobal(offX, 0, offZ), ShapeContext.absent());
+
+				if (!Block.isFaceFullSquare(shape, Direction.UP)) {
+					return Optional.empty();
+				}
+
 				pattern.add(state);
 			}
 		}
@@ -277,6 +324,10 @@ public class Telebooks implements DedicatedServerModInitializer {
 		public BookChain(int id, List<BlockState> pattern) {
 			this(id, pattern, new ArrayList<>());
 		}
+
+		public BookChain {
+			books = new ArrayList<>(books);
+		}
 	}
 	record Database(List<BookChain> books) {
 		static final Codec<Database> CODEC = RecordCodecBuilder.create(instance ->
@@ -288,6 +339,10 @@ public class Telebooks implements DedicatedServerModInitializer {
 		public Database() {
 			this(new ArrayList<>());
 		}
+
+		public Database {
+			books = new ArrayList<>(books);
+		}
 	}
 
 	static class State extends PersistentState {
@@ -297,16 +352,18 @@ public class Telebooks implements DedicatedServerModInitializer {
 			return value;
 		}, null);
 
+		private static PersistentStateManager getHost(MinecraftServer server) {
+			return Objects.requireNonNull(server.getWorld(World.OVERWORLD)).getPersistentStateManager();
+		}
+
 		public static State get(MinecraftServer server) {
-			var world = Objects.requireNonNull(server.getWorld(World.OVERWORLD));
+			return getHost(server).getOrCreate(type, MOD_ID);
+		}
+		public static void save(MinecraftServer server) {
+			var host = getHost(server);
 
-			var state = world.getPersistentStateManager().getOrCreate(type, MOD_ID);
-
-			// NB: Technically this is incorrect, but saving happens rather rarely, and it is much more
-			//  convenient to just assume that the state has changed.
-			state.markDirty();
-
-			return state;
+			host.getOrCreate(type, MOD_ID).markDirty();
+			host.save();
 		}
 
 		int nextChainID = 0;
@@ -354,6 +411,14 @@ public class Telebooks implements DedicatedServerModInitializer {
 	}
 
 	private ActionResult handleLecternUse(ServerWorld world, BlockPos pos) {
+		var server = world.getServer();
+
+		// Requirement: teleport lecterns must have a book
+		var blockEntity = world.getBlockEntity(pos, BlockEntityType.LECTERN);
+		if (blockEntity.isEmpty() || !blockEntity.get().hasBook()) {
+			return ActionResult.PASS;
+		}
+
 		var forward = world.getBlockState(pos).get(LecternBlock.FACING);
 		var center = pos.offset(forward, 2).offset(Direction.DOWN);
 
@@ -364,37 +429,59 @@ public class Telebooks implements DedicatedServerModInitializer {
 		}
 
 		// If so, locate corresponding book chain
-		var state = State.get(world.getServer());
+		var state = State.get(server);
 		var chain = state.getOrCreateBookChain(pattern.get());
 
-		// Check whether this book is a new joiner, and add them to the chain
+		var stateChanged = false;
+
+		// Trim target locations which became invalidated
+		stateChanged |= chain.books.removeIf(loc -> {
+			var world2 = server.getWorld(loc.world);
+
+			var candidatePattern = tryGetBookPattern(world2, loc.center, loc.forward);
+			if (candidatePattern.isEmpty()) {
+				return true;
+			}
+
+			return !pattern.equals(candidatePattern);
+		});
+
+		// Check whether this book is a new joiner, and add it to the chain
 		{
 			var book = new BookLocation(world.getRegistryKey(), center, forward);
 
 			if (!chain.books.contains(book)) {
 				chain.books.add(book);
+				stateChanged = true;
 			}
 		}
 
-		// Check target locations to see which ones still have the pattern intact
-		var targets = chain.books.stream().filter(loc -> {
-			var world2 = world.getServer().getWorld(loc.world);
-
-			var candidatePattern = tryGetBookPattern(world2, loc.center, loc.forward);
-			if (candidatePattern.isEmpty()) {
-				return false;
-			}
-
-			return pattern.equals(candidatePattern);
-		}).toList();
+		// Ensure changes are persisted
+		if (stateChanged) {
+			State.save(server);
+		}
 
 		// We might not have enough books intact to perform teleportation
-		if (targets.size() <= 1) {
+		if (chain.books.size() <= 1) {
 			return ActionResult.CONSUME;
 		}
 
 		// Rotate contents of area immediately above valid targets
-		LOGGER.info("Will rotate: {}", targets);
+		var previousVolume = new TeleportVolume();
+		{
+			var loc = chain.books.get(chain.books.size() - 1);
+
+			previousVolume.cut(server.getWorld(loc.world), loc.center, loc.forward);
+		}
+		for (var loc : chain.books) {
+			var world2 = server.getWorld(loc.world);
+
+			var currentVolume = new TeleportVolume();
+			currentVolume.cut(world2, loc.center, loc.forward);
+
+			previousVolume.paste(world2, loc.center, loc.forward);
+			previousVolume = currentVolume;
+		}
 
 		return ActionResult.CONSUME;
 	}
