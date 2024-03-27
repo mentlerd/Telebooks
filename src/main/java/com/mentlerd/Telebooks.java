@@ -325,6 +325,18 @@ public class Telebooks implements DedicatedServerModInitializer {
 						Direction.CODEC.fieldOf("forward").forGetter(BookLocation::forward)
 				).apply(instance, BookLocation::new)
 		);
+
+		public Box safeArea() {
+			return new Box(center).expand(1.45, 3, 1.45);
+		}
+
+		public boolean overlaps(BookLocation other) {
+			if (world != other.world) {
+				return false;
+			}
+
+			return safeArea().intersects(other.safeArea());
+		}
 	}
 	record BookChain(int id, List<BlockState> pattern, List<BookLocation> books) {
 		static final Codec<BookChain> CODEC = RecordCodecBuilder.create(instance ->
@@ -443,12 +455,14 @@ public class Telebooks implements DedicatedServerModInitializer {
 		}
 
 		// If so, locate corresponding book chain
-		var state = State.get(server);
-		var chain = state.getOrCreateBookChain(pattern.get());
+		var book = new BookLocation(world.getRegistryKey(), center, forward);
 
+		var state = State.get(server);
 		var stateChanged = false;
 
-		// Trim target locations which became invalidated
+		var chain = state.getOrCreateBookChain(pattern.get());
+
+		// Filter books which are no longer valid
 		stateChanged |= chain.books.removeIf(loc -> {
 			var world2 = server.getWorld(loc.world);
 
@@ -460,14 +474,16 @@ public class Telebooks implements DedicatedServerModInitializer {
 			return !pattern.equals(candidatePattern);
 		});
 
-		// Check whether this book is a new joiner, and add it to the chain
-		{
-			var book = new BookLocation(world.getRegistryKey(), center, forward);
+		// Make sure the activated book does not overlap the volume of any still valid
+		//  books, otherwise we cannot let it enter the family
+		if (chain.books.stream().filter(Predicate.not(book::equals)).anyMatch(book::overlaps)) {
+			return ActionResult.PASS;
+		}
 
-			if (!chain.books.contains(book)) {
-				chain.books.add(book);
-				stateChanged = true;
-			}
+		// Check whether this book is a new joiner, and add it to the chain
+		if (!chain.books.contains(book)) {
+			chain.books.add(book);
+			stateChanged = true;
 		}
 
 		// Ensure changes are persisted
