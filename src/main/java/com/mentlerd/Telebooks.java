@@ -29,6 +29,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.*;
+import java.util.function.Function;
+import java.util.function.Predicate;
 
 @SuppressWarnings("unused")
 public class Telebooks implements DedicatedServerModInitializer {
@@ -100,19 +102,19 @@ public class Telebooks implements DedicatedServerModInitializer {
 						}
 
 						blocks.add(new BlockInfo(offset, state, blockEntityData));
-
-						// Remove snapshot block
-						world.setBlockState(pos, Blocks.AIR.getDefaultState(), Block.NOTIFY_LISTENERS);
 					}
 				}
 			}
 
 			var centerPos = center.toCenterPos();
 
+			// NB: -0.5 extension is to support dropped items
 			var entityBox = new Box(
-				centerPos.add(mins.getX(), mins.getY(), mins.getZ()),
+				centerPos.add(mins.getX(), mins.getY(), mins.getZ()).add(0, -0.5, 0),
 				centerPos.add(maxs.getX(), maxs.getY(), maxs.getZ())
 			);
+
+			var capturedEntities = new HashSet<Entity>();
 
 			for (var entity : world.getNonSpectatingEntities(Entity.class, entityBox)) {
 				var offset = rotateOffset(entity.getPos().subtract(centerPos), rotation);
@@ -126,24 +128,29 @@ public class Telebooks implements DedicatedServerModInitializer {
 					continue;
 				}
 
-				var type = entity.getType();
+				// Entities within vehicles are saved together with the vehicle
+				if (entity.hasVehicle()) {
+					continue;
+				}
 
-				if (!type.isSaveable() || !type.isSummonable()) {
+				// Make sure entities are not captured twice
+				if (capturedEntities.contains(entity)) {
 					continue;
 				}
 
 				var entityData = new NbtCompound();
 
 				if (!entity.saveNbt(entityData)) {
-					LOGGER.warn("Failed to copy entity");
+					LOGGER.error("Failed to serialize entity");
 					continue;
 				}
 
-				entities.add(new EntityInfo(offset, type, entityData));
+				entities.add(new EntityInfo(offset, entity.getType(), entityData));
 
-				// Remove snapshot entity
-				entity.remove(Entity.RemovalReason.CHANGED_DIMENSION);
+				entity.streamSelfAndPassengers().filter(Predicate.not(Entity::isPlayer)).forEach(capturedEntities::add);
 			}
+
+			capturedEntities.forEach(Entity::discard);
 		}
 
 		public void paste(ServerWorld world, BlockPos center, Direction forward) {
@@ -192,13 +199,20 @@ public class Telebooks implements DedicatedServerModInitializer {
 
 				var spawnData = info.entityData.copy();
 				spawnData.put("Pos", posList);
-				spawnData.remove("UUID");
 
-				EntityType.getEntityFromNbt(spawnData, world).ifPresent(entity -> {
-					entity.refreshPositionAndAngles(pos.getX(), pos.getY(), pos.getZ(), entity.getYaw() + entity.applyRotation(rotation), entity.getPitch());
+				var entity = EntityType.loadEntityWithPassengers(spawnData, world, Function.identity());
+				if (entity == null) {
+					LOGGER.warn("Failed to load copied entity");
+					continue;
+				}
 
-					world.spawnEntityAndPassengers(entity);
-				});
+				// Make entity adjust to its new position
+				entity.refreshPositionAndAngles(pos.getX(), pos.getY(), pos.getZ(), entity.getYaw() + entity.applyRotation(rotation), entity.getPitch());
+
+				if (!world.spawnNewEntityAndPassengers(entity)) {
+					LOGGER.warn("Failed to spawn copied entity");
+					continue;
+				}
 			}
 
 			var playerPosFlags = EnumSet.noneOf(PositionFlag.class);
@@ -287,16 +301,16 @@ public class Telebooks implements DedicatedServerModInitializer {
 
 		for (int offX = -1; offX <= 1; offX++) {
 			for (int offZ = -1; offZ <= 1; offZ++) {
-				var state = transformed.getBlockState(offX, 0, offZ);
+				var pos = transformed.localToGlobal(offX, 0, offZ);
+				var state = world.getBlockState(pos);
 
-				// Requirement: patterns must be made of blocks which have a solid top surface to stand on
-				var shape = state.getCollisionShape(world, transformed.localToGlobal(offX, 0, offZ), ShapeContext.absent());
-
-				if (!Block.isFaceFullSquare(shape, Direction.UP)) {
+				// Requirement: patterns must be made of solid blocks
+				if (!state.isOpaqueFullCube(world, pos) && !state.isFullCube(world, pos)) {
 					return Optional.empty();
 				}
 
-				pattern.add(state);
+				// Tweak: ignore individual properties of blocks, only care about the type
+				pattern.add(state.getBlock().getDefaultState());
 			}
 		}
 
