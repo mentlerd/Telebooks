@@ -29,7 +29,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.*;
-import java.util.function.Function;
 import java.util.function.Predicate;
 
 @SuppressWarnings("unused")
@@ -63,6 +62,12 @@ public class Telebooks implements DedicatedServerModInitializer {
 		private final ArrayList<BlockInfo> blocks = new ArrayList<>();
 		private final ArrayList<EntityInfo> entities = new ArrayList<>();
 		private final ArrayList<PlayerInfo> players = new ArrayList<>();
+
+		// Passenger state is difficult to restore - serialized vehicles omit player passengers from
+		//  their list, but their order may matter (such as which player is controlling the boat)
+		record PlayerPassengerInfo(UUID player, int index) {}
+
+		private final HashMap<UUID, ArrayList<PlayerPassengerInfo>> playerPassengers = new HashMap<>();
 
 		public void cut(WorldAccess world, BlockPos center, Direction forward) {
 			var right = forward.rotateYClockwise();
@@ -128,6 +133,25 @@ public class Telebooks implements DedicatedServerModInitializer {
 					continue;
 				}
 
+				// Passenger information must be encoded, regardless of whether the entity
+				//  is a serialization root, or is serialized as part of another vehicle
+				{
+					var passengerInfo = new ArrayList<PlayerPassengerInfo>();
+					var passengers = entity.getPassengerList();
+
+					for (int index = 0; index < passengers.size(); index++) {
+						var passenger = passengers.get(index);
+
+						if (passenger.isPlayer()) {
+							passengerInfo.add(new PlayerPassengerInfo(passenger.getUuid(), index));
+						}
+					}
+
+					if (!passengerInfo.isEmpty()) {
+						playerPassengers.put(entity.getUuid(), passengerInfo);
+					}
+				}
+
 				// Entities within vehicles are saved together with the vehicle
 				if (entity.hasVehicle()) {
 					continue;
@@ -187,6 +211,7 @@ public class Telebooks implements DedicatedServerModInitializer {
 				}
 			}
 
+			var loadedEntities = new HashMap<UUID, Entity>();
 			var centerPos = center.toCenterPos();
 
 			for (var info : entities) {
@@ -200,7 +225,10 @@ public class Telebooks implements DedicatedServerModInitializer {
 				var spawnData = info.entityData.copy();
 				spawnData.put("Pos", posList);
 
-				var entity = EntityType.loadEntityWithPassengers(spawnData, world, Function.identity());
+				var entity = EntityType.loadEntityWithPassengers(spawnData, world, loaded -> {
+					loadedEntities.put(loaded.getUuid(), loaded);
+					return loaded;
+				});
 				if (entity == null) {
 					LOGGER.warn("Failed to load copied entity");
 					continue;
@@ -224,6 +252,30 @@ public class Telebooks implements DedicatedServerModInitializer {
 				var player = info.player;
 
 				player.teleport(world, pos.x, pos.y, pos.z, playerPosFlags, yaw, player.getPitch());
+				player.dismountVehicle();
+			}
+
+			for (var entry : playerPassengers.entrySet()) {
+				var vehicle = loadedEntities.get(entry.getKey());
+				if (vehicle == null) {
+					continue;
+				}
+
+				// Current passenger list, players omitted. Restoring the pre-save list is
+				//  possible by inserting all players into the list at their respective
+				//  positions, and re-mounting everyone onto the vehicle
+				var passengersWithPlayers = new ArrayList<>(vehicle.getPassengerList());
+
+				for (var info : entry.getValue()) {
+					var player = world.getPlayerByUuid(info.player);
+
+					passengersWithPlayers.add(info.index, player);
+				}
+
+				passengersWithPlayers.forEach(Entity::dismountVehicle);
+				passengersWithPlayers.forEach(passenger -> {
+					passenger.startRiding(vehicle);
+				});
 			}
 		}
 	}
