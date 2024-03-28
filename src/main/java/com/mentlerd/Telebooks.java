@@ -84,6 +84,8 @@ public class Telebooks implements DedicatedServerModInitializer {
 				case NORTH -> BlockRotation.CLOCKWISE_90;
 			};
 
+			// Tweak: Don't teleport blocks for now
+			/*
 			for (int offX = mins.getX(); offX <= maxs.getX(); offX++) {
 				for (int offY = mins.getY(); offY <= maxs.getY(); offY++) {
 					for (int offZ = mins.getZ(); offZ <= maxs.getZ(); offZ++) {
@@ -110,6 +112,7 @@ public class Telebooks implements DedicatedServerModInitializer {
 					}
 				}
 			}
+			*/
 
 			var centerPos = center.toCenterPos();
 
@@ -174,7 +177,7 @@ public class Telebooks implements DedicatedServerModInitializer {
 				entity.streamSelfAndPassengers().filter(Predicate.not(Entity::isPlayer)).forEach(capturedEntities::add);
 			}
 
-			capturedEntities.forEach(Entity::discard);
+			capturedEntities.forEach(entity -> entity.remove(Entity.RemovalReason.CHANGED_DIMENSION));
 		}
 
 		public void paste(ServerWorld world, BlockPos center, Direction forward) {
@@ -514,16 +517,24 @@ public class Telebooks implements DedicatedServerModInitializer {
 
 		var chain = state.getOrCreateBookChain(pattern.get());
 
-		// Filter books which are no longer valid
+		// Make sure the activated book does not overlay the volume of any still valid books,
+		//  otherwise we cannot let it enter the family
 		stateChanged |= chain.books.removeIf(loc -> {
-			var world2 = server.getWorld(loc.world);
+			if (book.equals(loc)) {
+				return false;
+			}
+			if (!book.overlaps(loc)) {
+				return false;
+			}
 
-			var candidatePattern = tryGetBookPattern(world2, loc.center, loc.forward);
-			if (candidatePattern.isEmpty()) {
+			var siblingWorld = server.getWorld(loc.world);
+
+			var siblingPattern = tryGetBookPattern(siblingWorld, loc.center, loc.forward);
+			if (siblingPattern.isEmpty()) {
 				return true;
 			}
 
-			return !pattern.equals(candidatePattern);
+			return !pattern.equals(siblingPattern);
 		});
 
 		// Make sure the activated book does not overlap the volume of any still valid
@@ -548,22 +559,12 @@ public class Telebooks implements DedicatedServerModInitializer {
 			return ActionResult.CONSUME;
 		}
 
-		// Rotate contents of area immediately above valid targets
-		var previousVolume = new TeleportVolume();
-		{
-			var loc = chain.books.get(chain.books.size() - 1);
+		// Move teleported volume from this book to the next
+		var next = chain.books.get((chain.books.indexOf(book) + 1) % chain.books.size());
 
-			previousVolume.cut(server.getWorld(loc.world), loc.center, loc.forward);
-		}
-		for (var loc : chain.books) {
-			var world2 = server.getWorld(loc.world);
-
-			var currentVolume = new TeleportVolume();
-			currentVolume.cut(world2, loc.center, loc.forward);
-
-			previousVolume.paste(world2, loc.center, loc.forward);
-			previousVolume = currentVolume;
-		}
+		var volume = new TeleportVolume();
+		volume.cut(server.getWorld(book.world), book.center, book.forward);
+		volume.paste(server.getWorld(next.world), next.center, next.forward);
 
 		return ActionResult.CONSUME;
 	}
