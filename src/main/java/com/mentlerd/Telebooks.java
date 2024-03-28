@@ -549,22 +549,35 @@ public class Telebooks implements DedicatedServerModInitializer {
 			stateChanged = true;
 		}
 
+		// Locate next valid book to teleport to, at this point its fine to start loading chunks
+		var brokenBooks = new ArrayList<BookLocation>();
+
+		int base = chain.books.indexOf(book);
+
+		for (int offset = 1; offset < chain.books.size(); offset++) {
+			var next = chain.books.get((base + offset) % chain.books.size());
+
+			var nextWorld = server.getWorld(next.world);
+
+			var nextPattern = tryGetBookPattern(nextWorld, next.center, next.forward);
+			if (nextPattern.isEmpty()) {
+				brokenBooks.add(next);
+				continue;
+			}
+
+			var volume = new TeleportVolume();
+			volume.cut(world, book.center, book.forward);
+			volume.paste(nextWorld, next.center, next.forward);
+			break;
+		}
+
+		// Remove books we tried to teleport to, but were broken
+		stateChanged |= chain.books.removeAll(brokenBooks);
+
 		// Ensure changes are persisted
 		if (stateChanged) {
 			State.save(server);
 		}
-
-		// We might not have enough books intact to perform teleportation
-		if (chain.books.size() <= 1) {
-			return ActionResult.CONSUME;
-		}
-
-		// Move teleported volume from this book to the next
-		var next = chain.books.get((chain.books.indexOf(book) + 1) % chain.books.size());
-
-		var volume = new TeleportVolume();
-		volume.cut(server.getWorld(book.world), book.center, book.forward);
-		volume.paste(server.getWorld(next.world), next.center, next.forward);
 
 		return ActionResult.CONSUME;
 	}
