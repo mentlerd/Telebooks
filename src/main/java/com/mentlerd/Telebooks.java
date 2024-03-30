@@ -22,10 +22,7 @@ import net.minecraft.util.*;
 import net.minecraft.util.dynamic.Codecs;
 import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.*;
-import net.minecraft.world.PersistentState;
-import net.minecraft.world.PersistentStateManager;
-import net.minecraft.world.World;
-import net.minecraft.world.WorldAccess;
+import net.minecraft.world.*;
 
 import net.minecraft.world.chunk.ChunkStatus;
 import org.slf4j.Logger;
@@ -331,31 +328,47 @@ public class Telebooks implements DedicatedServerModInitializer {
 		}
 	}
 
+	static Optional<Block> checkUniformFrame(World world, BlockPos center, int radius) {
+		var requiredBlock = world.getBlockState(center.add(0, 0, radius)).getBlock();
+
+		for (int off = -radius; off < radius; off++) {
+			if (!world.getBlockState(center.add(off, 0, +radius)).isOf(requiredBlock)) {
+				return Optional.empty();
+			}
+			if (!world.getBlockState(center.add(off, 0, -radius)).isOf(requiredBlock)) {
+				return Optional.empty();
+			}
+			if (!world.getBlockState(center.add(+radius, 0, off)).isOf(requiredBlock)) {
+				return Optional.empty();
+			}
+			if (!world.getBlockState(center.add(-radius, 0, off)).isOf(requiredBlock)) {
+				return Optional.empty();
+			}
+		}
+
+		return Optional.of(requiredBlock);
+	}
+
 	static Optional<List<BlockState>> tryGetBookPattern(World world, BlockPos center, Direction forward) {
-		var transformed = new TransformedWorld(world, center, forward);
-
 		final int patternRadius = 1;
-
-		// Requirement: valid patterns are surrounded by an obsidian frame
 		final int frameRadius = patternRadius + 1;
-		final var frameMaterial = Blocks.OBSIDIAN;
 
-		for (int off = -frameRadius; off < frameRadius; off++) {
-			if (!transformed.getBlockState(off, 0, +frameRadius).isOf(frameMaterial)) {
-				return Optional.empty();
-			}
-			if (!transformed.getBlockState(off, 0, -frameRadius).isOf(frameMaterial)) {
-				return Optional.empty();
-			}
-			if (!transformed.getBlockState(+frameRadius, 0, off).isOf(frameMaterial)) {
-				return Optional.empty();
-			}
-			if (!transformed.getBlockState(-frameRadius, 0, off).isOf(frameMaterial)) {
+		// Requirement: valid patterns are surrounded by a uniform material
+		var decorativeFrame = checkUniformFrame(world, center, frameRadius);
+		if (decorativeFrame.isEmpty()) {
+			return Optional.empty();
+		}
+
+		// Requirement: valid patterns need an obsidian frame around them, or immediately below
+		if (decorativeFrame.get() != Blocks.OBSIDIAN) {
+			var functionalFrame = checkUniformFrame(world, center.down(), frameRadius);
+			if (functionalFrame.isEmpty() || functionalFrame.get() != Blocks.OBSIDIAN) {
 				return Optional.empty();
 			}
 		}
 
 		// Actual pattern is parsed in the local coordinate system
+		var transformed = new TransformedWorld(world, center, forward);
 		var pattern = new ArrayList<BlockState>();
 
 		for (int offX = -1; offX <= 1; offX++) {
@@ -365,6 +378,11 @@ public class Telebooks implements DedicatedServerModInitializer {
 
 				// Requirement: patterns must be made of solid blocks
 				if (!state.isOpaqueFullCube(world, pos) && !state.isFullCube(world, pos)) {
+					return Optional.empty();
+				}
+
+				// Requirement: no outside pattern block may be made of the decorative frame block
+				if (offX != 0 && offZ != 0 && state.isOf(decorativeFrame.get())) {
 					return Optional.empty();
 				}
 
