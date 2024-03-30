@@ -382,7 +382,7 @@ public class Telebooks implements DedicatedServerModInitializer {
 		);
 
 		public Box safeArea() {
-			return new Box(center).expand(1.45, 3, 1.45);
+			return new Box(center).offset(0, 1.5, 0).expand(1.45, 1.5, 1.45);
 		}
 
 		public boolean overlaps(BookLocation other) {
