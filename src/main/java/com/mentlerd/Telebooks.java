@@ -1,5 +1,6 @@
 package com.mentlerd;
 
+import com.mentlerd.mixin.ServerChunkManagerAccessor;
 import com.mojang.serialization.Codec;
 import com.mojang.serialization.codecs.RecordCodecBuilder;
 import net.fabricmc.api.DedicatedServerModInitializer;
@@ -15,6 +16,7 @@ import net.minecraft.nbt.*;
 import net.minecraft.network.packet.s2c.play.PositionFlag;
 import net.minecraft.registry.RegistryKey;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.world.ChunkTicketType;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.*;
 import net.minecraft.util.dynamic.Codecs;
@@ -25,17 +27,19 @@ import net.minecraft.world.PersistentStateManager;
 import net.minecraft.world.World;
 import net.minecraft.world.WorldAccess;
 
+import net.minecraft.world.chunk.ChunkStatus;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.Predicate;
 
 @SuppressWarnings("unused")
 public class Telebooks implements DedicatedServerModInitializer {
 	public static final String MOD_ID = "telebooks";
 
-	public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
+	public static final Logger LOGGER = LoggerFactory.getLogger(Telebooks.class);
 
 	static Vec3d rotateOffset(Vec3d vec, BlockRotation rotation) {
 		return switch (rotation) {
@@ -491,6 +495,66 @@ public class Telebooks implements DedicatedServerModInitializer {
 		}
 	}
 
+	static ChunkTicketType<Integer> TELEBOOK_FORCE = ChunkTicketType.create("telebook.force", Integer::compareTo);
+	static ChunkTicketType<Integer> TELEBOOK_POST_LOAD = ChunkTicketType.create("telebook.force", Integer::compareTo, 20);
+
+	int nextChunkTicketID = 0;
+
+	private CompletableFuture<BookLocation> asyncChunkLoad(ServerWorld world, BookLocation loc) {
+		var manager = world.getChunkManager();
+
+		// Check preconditions, lest we violate threading constraints
+		var accessor = (ServerChunkManagerAccessor) manager;
+		if (accessor.getServerThread() != Thread.currentThread()) {
+			throw new IllegalStateException();
+		}
+
+		// Determine which chunks we need to load to check the book position
+		var chunks = new ArrayList<ChunkPos>();
+		{
+			var chunkX = ChunkSectionPos.getSectionCoord(loc.center.getX());
+			var chunkZ = ChunkSectionPos.getSectionCoord(loc.center.getZ());
+
+			for (int offX = -1; offX <= 1; offX++) {
+				for (int offZ = -1; offZ <= 1; offZ++) {
+					chunks.add(new ChunkPos(chunkX + offX, chunkZ + offZ));
+				}
+			}
+		}
+
+		// Initiate chunk loading, capture futures
+		var chunkFutures = new ArrayList<CompletableFuture<?>>();
+		var ticketID = nextChunkTicketID++;
+
+		for (var chunkPos : chunks) {
+			// Make sure loaded chunks remain in memory, even if their arrival is spread across multiple server ticks.
+			manager.addTicket(TELEBOOK_FORCE, chunkPos, 1, ticketID);
+
+			// Invoke internal method which does _not_ pump server events until the chunk loading is complete.
+			chunkFutures.add(accessor.invokeGetChunkFuture(chunkPos.x, chunkPos.z, ChunkStatus.FULL, true));
+		}
+
+		// Synchronize
+		var chunksLoaded = CompletableFuture.allOf(chunkFutures.toArray(new CompletableFuture[0]));
+
+		var ticketsUpdated = chunksLoaded.handle((nothing, error) -> {
+			// Loading either complete, or something went awry - replace permanent tickets with permanent ones
+			for (var chunkPos : chunks) {
+				manager.removeTicket(TELEBOOK_FORCE, chunkPos, 1, ticketID);
+
+				if (error == null) {
+					manager.addTicket(TELEBOOK_POST_LOAD, chunkPos, 1, ticketID);
+				}
+			}
+
+			return nothing;
+		});
+
+		return ticketsUpdated.thenApply((nothing) -> loc);
+	}
+
+	int nextTeleportSequenceID = 0;
+
 	private ActionResult handleLecternUse(ServerWorld world, BlockPos pos) {
 		var server = world.getServer();
 
@@ -549,34 +613,68 @@ public class Telebooks implements DedicatedServerModInitializer {
 			stateChanged = true;
 		}
 
-		// Locate next valid book to teleport to, at this point its fine to start loading chunks
-		var brokenBooks = new ArrayList<BookLocation>();
-
-		int base = chain.books.indexOf(book);
-
-		for (int offset = 1; offset < chain.books.size(); offset++) {
-			var next = chain.books.get((base + offset) % chain.books.size());
-
-			var nextWorld = server.getWorld(next.world);
-
-			var nextPattern = tryGetBookPattern(nextWorld, next.center, next.forward);
-			if (nextPattern.isEmpty()) {
-				brokenBooks.add(next);
-				continue;
-			}
-
-			var volume = new TeleportVolume();
-			volume.cut(world, book.center, book.forward);
-			volume.paste(nextWorld, next.center, next.forward);
-			break;
-		}
-
-		// Remove books we tried to teleport to, but were broken
-		stateChanged |= chain.books.removeAll(brokenBooks);
-
 		// Ensure changes are persisted
 		if (stateChanged) {
 			State.save(server);
+		}
+
+		// Build sequence of books we should try to teleport to
+		var candidates = new ArrayList<>(chain.books);
+		{
+			// Rotate book list so that the current book is the first in the sequence
+			Collections.rotate(candidates, -candidates.indexOf(book));
+
+			// Pop current book
+			candidates.remove(0);
+		}
+
+		// Asynchronous teleportation sequence officially begins
+		int sequenceID = nextTeleportSequenceID++;
+
+		LOGGER.debug("[{}]: Teleportation sequence starts, {} candidates", sequenceID, candidates.size());
+
+		// Create future sequence that asynchronously determines the first valid candidate
+		//  to teleport to, while also removing invalidated entries
+		//
+		// Start with a 'failed' stage
+		var teleportSuccessful = CompletableFuture.completedFuture(false);
+
+		for (var target : candidates) {
+			teleportSuccessful = teleportSuccessful.thenCompose((success) -> {
+				if (success) {
+					LOGGER.debug("[{}]: Teleportation handled by prior target, skipping {}", sequenceID, target);
+					return CompletableFuture.completedFuture(true);
+				}
+
+				var targetWorld = server.getWorld(target.world);
+				if (targetWorld == null) {
+					LOGGER.warn("[{}]: Target references unknown world, skipping {}", sequenceID, target);
+					return CompletableFuture.completedFuture(false);
+				}
+
+				LOGGER.debug("[{}]: Loading chunks asynchronously for {}", sequenceID, target);
+
+				return asyncChunkLoad(targetWorld, target).thenApply((loc) -> {
+					LOGGER.debug("[{}]: Chunks loaded. Verifying pattern for {}", sequenceID, target);
+
+					var targetPattern = tryGetBookPattern(targetWorld, target.center, target.forward);
+					if (targetPattern.isEmpty()) {
+						LOGGER.debug("[{}]: Target pattern damaged, removing location from rotation", sequenceID);
+
+						chain.books.remove(target);
+						State.save(server);
+
+						return false;
+					}
+
+					LOGGER.debug("[{}]: Pattern verified, transfer underway", sequenceID);
+
+					var volume = new TeleportVolume();
+					volume.cut(world, book.center, book.forward);
+					volume.paste(targetWorld, target.center, target.forward);
+					return true;
+				});
+			});
 		}
 
 		return ActionResult.CONSUME;

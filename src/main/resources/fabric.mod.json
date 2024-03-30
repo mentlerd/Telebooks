@@ -16,6 +16,12 @@
 			"com.mentlerd.Telebooks"
 		]
 	},
+	"mixins": [
+		{
+			"config": "telebooks.mixins.json",
+			"environment": "server"
+		}
+	],
 	"depends": {
 		"fabricloader": ">=0.15.0",
 		"minecraft": "~1.20.4",
