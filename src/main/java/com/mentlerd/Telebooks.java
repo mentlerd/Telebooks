@@ -258,6 +258,9 @@ public class Telebooks implements DedicatedServerModInitializer {
 
 				player.dismountVehicle();
 				player.teleport(world, pos.x, pos.y, pos.z, playerPosFlags, yaw, player.getPitch());
+
+				// NB: This is here to trigger a resync of the player experience level
+				player.addExperience(0);
 			}
 
 			for (var entry : playerPassengers.entrySet()) {
