@@ -57,7 +57,7 @@ public class Telebooks implements DedicatedServerModInitializer {
 
 	static class TeleportVolume {
 		record BlockInfo(Vec3i offset, BlockState state, NbtCompound blockEntityData) {}
-		record EntityInfo(Vec3d offset, EntityType<?> type, NbtCompound entityData) {}
+		record EntityInfo(Vec3d offset, float yaw, EntityType<?> type, NbtCompound entityData) {}
 		record PlayerInfo(Vec3d offset, float yaw, PlayerEntity player) {}
 
 		private final ArrayList<BlockInfo> blocks = new ArrayList<>();
@@ -127,11 +127,11 @@ public class Telebooks implements DedicatedServerModInitializer {
 
 			for (var entity : world.getNonSpectatingEntities(Entity.class, entityBox)) {
 				var offset = rotateOffset(entity.getPos().subtract(centerPos), rotation);
+				var yaw = rotateYaw(entity.getYaw(), rotation);
 
 				// Players are an exception, they are truly transferred instead of being copied
 				if (entity.isPlayer()) {
 					var player = (PlayerEntity) entity;
-					var yaw = rotateYaw(player.getYaw(), rotation);
 
 					players.add(new PlayerInfo(offset, yaw, player));
 					continue;
@@ -173,7 +173,7 @@ public class Telebooks implements DedicatedServerModInitializer {
 					continue;
 				}
 
-				entities.add(new EntityInfo(offset, entity.getType(), entityData));
+				entities.add(new EntityInfo(offset, yaw, entity.getType(), entityData));
 
 				entity.streamSelfAndPassengers().filter(Predicate.not(Entity::isPlayer)).forEach(capturedEntities::add);
 			}
@@ -239,7 +239,8 @@ public class Telebooks implements DedicatedServerModInitializer {
 				}
 
 				// Make entity adjust to its new position
-				entity.refreshPositionAndAngles(pos.getX(), pos.getY(), pos.getZ(), entity.getYaw() + entity.applyRotation(rotation), entity.getPitch());
+				entity.setYaw(rotateYaw(info.yaw, rotation));
+				entity.requestTeleport(pos.getX(), pos.getY(), pos.getZ());
 
 				if (!world.spawnNewEntityAndPassengers(entity)) {
 					LOGGER.warn("Failed to spawn copied entity");
@@ -255,8 +256,8 @@ public class Telebooks implements DedicatedServerModInitializer {
 
 				var player = info.player;
 
-				player.teleport(world, pos.x, pos.y, pos.z, playerPosFlags, yaw, player.getPitch());
 				player.dismountVehicle();
+				player.teleport(world, pos.x, pos.y, pos.z, playerPosFlags, yaw, player.getPitch());
 			}
 
 			for (var entry : playerPassengers.entrySet()) {
@@ -272,14 +273,15 @@ public class Telebooks implements DedicatedServerModInitializer {
 
 				for (var info : entry.getValue()) {
 					var player = world.getPlayerByUuid(info.player);
+					if (player == null) {
+						continue;
+					}
 
 					passengersWithPlayers.add(info.index, player);
 				}
 
 				passengersWithPlayers.forEach(Entity::dismountVehicle);
-				passengersWithPlayers.forEach(passenger -> {
-					passenger.startRiding(vehicle);
-				});
+				passengersWithPlayers.forEach(passenger -> passenger.startRiding(vehicle, true));
 			}
 		}
 	}
