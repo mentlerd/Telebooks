@@ -9,6 +9,7 @@ import net.fabricmc.fabric.api.event.player.UseBlockCallback;
 
 import net.minecraft.block.*;
 import net.minecraft.block.entity.BlockEntityType;
+import net.minecraft.block.entity.LecternBlockEntity;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityType;
 import net.minecraft.entity.player.PlayerEntity;
@@ -357,6 +358,12 @@ public class Telebooks implements DedicatedServerModInitializer {
 	static Optional<List<BlockState>> tryGetBookPattern(World world, BlockPos center, Direction forward) {
 		final int patternRadius = 1;
 		final int frameRadius = patternRadius + 1;
+
+		// Requirement: valid patterns need a lectern with a book
+		var lectern = world.getBlockEntity(center.offset(forward, -2).up(), BlockEntityType.LECTERN);
+		if (lectern.isEmpty() || !lectern.get().hasBook()) {
+			return Optional.empty();
+		}
 
 		// Requirement: valid patterns are surrounded by a uniform material
 		var decorativeFrame = checkUniformFrame(world, center, frameRadius);
