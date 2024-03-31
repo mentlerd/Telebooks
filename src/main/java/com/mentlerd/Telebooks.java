@@ -676,8 +676,8 @@ public class Telebooks implements DedicatedServerModInitializer {
 					LOGGER.debug("[{}]: Chunks loaded. Verifying pattern for {}", sequenceID, target);
 
 					var targetPattern = tryGetBookPattern(targetWorld, target.center, target.forward);
-					if (targetPattern.isEmpty()) {
-						LOGGER.debug("[{}]: Target pattern damaged, removing location from rotation", sequenceID);
+					if (!targetPattern.equals(pattern)) {
+						LOGGER.debug("[{}]: Target pattern changed, removing location from rotation", sequenceID);
 
 						chain.books.remove(target);
 						State.save(server);
