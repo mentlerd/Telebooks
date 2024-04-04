@@ -11,6 +11,7 @@ import net.fabricmc.fabric.api.event.player.UseBlockCallback;
 
 import net.minecraft.block.*;
 import net.minecraft.block.entity.BlockEntityType;
+import net.minecraft.block.entity.SignBlockEntity;
 import net.minecraft.command.argument.BlockPosArgumentType;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityType;
@@ -417,14 +418,28 @@ public class Telebooks implements DedicatedServerModInitializer {
 		return Optional.of(pattern);
 	}
 
-	record BookLocation(RegistryKey<World> world, BlockPos center, Direction forward) {
+	record BookLocation(RegistryKey<World> world, BlockPos center, Direction forward, Optional<String> flavour) {
 		static final Codec<BookLocation> CODEC = RecordCodecBuilder.create(instance ->
 				instance.group(
 						World.CODEC.fieldOf("world").forGetter(BookLocation::world),
 						BlockPos.CODEC.fieldOf("center").forGetter(BookLocation::center),
-						Direction.CODEC.fieldOf("forward").forGetter(BookLocation::forward)
+						Direction.CODEC.fieldOf("forward").forGetter(BookLocation::forward),
+						Codec.STRING.optionalFieldOf("flavour").forGetter(BookLocation::flavour)
 				).apply(instance, BookLocation::new)
 		);
+
+		public boolean equalsWithoutFlavour(BookLocation other) {
+			if (!world.equals(other.world)) {
+				return false;
+			}
+			if (!center.equals(other.center)) {
+				return false;
+			}
+			if (!forward.equals(other.forward)) {
+				return false;
+			}
+			return true;
+		}
 
 		public Box safeArea() {
 			return new Box(center).offset(0, 1.5, 0).expand(1.45, 1.5, 1.45);
@@ -626,8 +641,26 @@ public class Telebooks implements DedicatedServerModInitializer {
 		//  rather janky quick-fix band-aid solution, but should work most of the time
 		world.getPointOfInterestStorage().remove(pos);
 
+		// Build flavour text from a standingSign in near the lectern
+		Optional<String> flavour = Optional.empty();
+
+		for (var nearPos : BlockPos.iterateOutwards(center.up(2), 3, 1, 3)) {
+			var nearBlockEntity = world.getBlockEntity(nearPos);
+			if (nearBlockEntity instanceof SignBlockEntity sign) {
+				var contents = new StringBuilder();
+
+				for (var message : sign.getFrontText().getMessages(false)) {
+					contents.append(message.getString());
+					contents.append('\n');
+				}
+
+				flavour = Optional.of(contents.toString());
+				break;
+			}
+		}
+
 		// If so, locate corresponding book chain
-		var book = new BookLocation(world.getRegistryKey(), center, forward);
+		var book = new BookLocation(world.getRegistryKey(), center, forward, flavour);
 
 		var state = State.get(server);
 		var stateChanged = false;
@@ -637,7 +670,7 @@ public class Telebooks implements DedicatedServerModInitializer {
 		// Make sure the activated book does not overlay the volume of any still valid books,
 		//  otherwise we cannot let it enter the family
 		stateChanged |= chain.books.removeIf(loc -> {
-			if (book.equals(loc)) {
+			if (book.equalsWithoutFlavour(loc)) {
 				return false;
 			}
 			if (!book.overlaps(loc)) {
@@ -659,13 +692,25 @@ public class Telebooks implements DedicatedServerModInitializer {
 
 		// Make sure the activated book does not overlap the volume of any still valid
 		//  books, otherwise we cannot let it enter the family
-		if (chain.books.stream().filter(Predicate.not(book::equals)).anyMatch(book::overlaps)) {
+		if (chain.books.stream().filter(Predicate.not(book::equalsWithoutFlavour)).anyMatch(book::overlaps)) {
 			return ActionResult.PASS;
 		}
 
 		// Check whether this book is a new joiner, and add it to the chain
-		if (!chain.books.contains(book)) {
+		var existing = chain.books.stream().filter(book::equalsWithoutFlavour).findFirst();
+		if (existing.isEmpty()) {
 			chain.books.add(book);
+
+			stateChanged = true;
+		}
+
+		// Update flavour text upon activation
+		if (existing.isPresent() && !existing.get().equals(book)) {
+			var newChain = chain.books.stream().map(loc -> loc.equalsWithoutFlavour(book) ? book : loc).toList();
+
+			chain.books.clear();
+			chain.books.addAll(newChain);
+
 			stateChanged = true;
 		}
 
@@ -688,8 +733,8 @@ public class Telebooks implements DedicatedServerModInitializer {
 
 				var page = Text.empty();
 
-				page.append(loc.center.toShortString());
-				page.append("\n\n");
+				page.append(loc.flavour.orElse("\n???\n\n\n"));
+				page.append("\n");
 
 				if (loc.equals(book)) {
 					page.append(Text.literal("(You are here)"));
