@@ -1,18 +1,15 @@
 package com.mentlerd;
 
 import com.mentlerd.mixin.ServerChunkManagerAccessor;
-import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.serialization.Codec;
 import com.mojang.serialization.codecs.RecordCodecBuilder;
 import net.fabricmc.api.DedicatedServerModInitializer;
 
-import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.event.player.UseBlockCallback;
 
 import net.minecraft.block.*;
 import net.minecraft.block.entity.BlockEntityType;
 import net.minecraft.block.entity.SignBlockEntity;
-import net.minecraft.command.argument.BlockPosArgumentType;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityType;
 import net.minecraft.entity.player.PlayerEntity;
@@ -26,8 +23,7 @@ import net.minecraft.network.packet.s2c.play.PositionFlag;
 import net.minecraft.registry.RegistryKey;
 import net.minecraft.screen.*;
 import net.minecraft.server.MinecraftServer;
-import net.minecraft.server.command.CommandManager;
-import net.minecraft.server.command.ServerCommandSource;
+import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.server.world.ChunkTicketType;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.text.*;
@@ -268,6 +264,10 @@ public class Telebooks implements DedicatedServerModInitializer {
 				var yaw = rotateYaw(info.yaw, rotation);
 
 				var player = info.player;
+
+				if (player instanceof ServerPlayerEntity serverPlayer) {
+					serverPlayer.closeHandledScreen();
+				}
 
 				player.dismountVehicle();
 				player.teleport(world, pos.x, pos.y, pos.z, playerPosFlags, yaw, player.getPitch());
@@ -728,7 +728,9 @@ public class Telebooks implements DedicatedServerModInitializer {
 
 			var pages = new NbtList();
 
-			for (int siblingIndex = 0; siblingIndex < chain.books.size(); siblingIndex++) {
+			int siblingCount = chain.books.size();
+
+			for (int siblingIndex = 0; siblingIndex < siblingCount; siblingIndex++) {
 				var loc = chain.books.get(siblingIndex);
 
 				var page = Text.empty();
@@ -739,10 +741,11 @@ public class Telebooks implements DedicatedServerModInitializer {
 				if (loc.equals(book)) {
 					page.append(Text.literal("(You are here)"));
 				} else {
-					int finalIndex = siblingIndex;
+					var pageIndex = Integer.toString((siblingIndex + 1) % siblingCount + 1);
+
 					page.append(Text.literal("Teleport!").styled(style -> style
 						.withUnderline(true)
-						.withClickEvent(new ClickEvent(ClickEvent.Action.RUN_COMMAND, commandPrefix + finalIndex))
+						.withClickEvent(new ClickEvent(ClickEvent.Action.CHANGE_PAGE, pageIndex))
 					));
 				}
 
@@ -767,6 +770,12 @@ public class Telebooks implements DedicatedServerModInitializer {
 						public boolean onButtonClick(PlayerEntity player, int id) {
 							if (id == LecternScreenHandler.TAKE_BOOK_BUTTON_ID) {
 								return false;
+							}
+							if (id >= 100) {
+								int siblingIndex = (id - 101 + siblingCount) % siblingCount;
+
+								handleLecternUse(player, world, pos, siblingIndex);
+								return true;
 							}
 
 							return super.onButtonClick(player, id);
@@ -873,28 +882,6 @@ public class Telebooks implements DedicatedServerModInitializer {
 			}
 
 			return handleLecternUse(player, (ServerWorld) world, blockPos, null);
-		});
-
-		CommandRegistrationCallback.EVENT.register((dispatcher, registry, environment) -> {
-			var cmd = CommandManager
-				.literal("telebook_trigger")
-				.requires(ServerCommandSource::isExecutedByPlayer)
-				.then(CommandManager.argument("lectern", BlockPosArgumentType.blockPos())
-				.then(CommandManager.argument("targetIndex", IntegerArgumentType.integer())
-				.executes(ctx -> {
-					var player = ctx.getSource().getPlayerOrThrow();
-					if (player.isSpectator()) {
-						return 0;
-					}
-
-					var pos = BlockPosArgumentType.getLoadedBlockPos(ctx, "lectern");
-					var index = IntegerArgumentType.getInteger(ctx, "targetIndex");
-
-					handleLecternUse(player, player.getServerWorld(), pos, index);
-					return 1;
-				})));
-
-			dispatcher.register(cmd);
 		});
 	}
 }
