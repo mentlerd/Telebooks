@@ -622,6 +622,10 @@ public class Telebooks implements DedicatedServerModInitializer {
 			}
 		}
 
+		// Try to discourage villagers from claiming the lectern as a job site - this is a
+		//  rather janky quick-fix band-aid solution, but should work most of the time
+		world.getPointOfInterestStorage().remove(pos);
+
 		// If so, locate corresponding book chain
 		var book = new BookLocation(world.getRegistryKey(), center, forward);
 
