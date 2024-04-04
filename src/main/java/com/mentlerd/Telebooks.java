@@ -1,5 +1,6 @@
 package com.mentlerd;
 
+import com.google.common.base.Predicates;
 import com.mentlerd.mixin.ServerChunkManagerAccessor;
 import com.mojang.serialization.Codec;
 import com.mojang.serialization.codecs.RecordCodecBuilder;
@@ -639,7 +640,13 @@ public class Telebooks implements DedicatedServerModInitializer {
 
 		// Try to discourage villagers from claiming the lectern as a job site - this is a
 		//  rather janky quick-fix band-aid solution, but should work most of the time
-		world.getPointOfInterestStorage().remove(pos);
+		{
+			var poiStorage = world.getPointOfInterestStorage();
+
+			if (poiStorage.test(pos, Predicates.alwaysTrue())) {
+				poiStorage.remove(pos);
+			}
+		}
 
 		// Build flavour text from a standingSign in near the lectern
 		Optional<String> flavour = Optional.empty();
