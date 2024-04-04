@@ -1,24 +1,35 @@
 package com.mentlerd;
 
 import com.mentlerd.mixin.ServerChunkManagerAccessor;
+import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.serialization.Codec;
 import com.mojang.serialization.codecs.RecordCodecBuilder;
 import net.fabricmc.api.DedicatedServerModInitializer;
 
+import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.event.player.UseBlockCallback;
 
 import net.minecraft.block.*;
 import net.minecraft.block.entity.BlockEntityType;
-import net.minecraft.block.entity.LecternBlockEntity;
+import net.minecraft.command.argument.BlockPosArgumentType;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityType;
 import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.entity.player.PlayerInventory;
+import net.minecraft.inventory.SimpleInventory;
+import net.minecraft.item.ItemStack;
+import net.minecraft.item.Items;
+import net.minecraft.item.WrittenBookItem;
 import net.minecraft.nbt.*;
 import net.minecraft.network.packet.s2c.play.PositionFlag;
 import net.minecraft.registry.RegistryKey;
+import net.minecraft.screen.*;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.command.CommandManager;
+import net.minecraft.server.command.ServerCommandSource;
 import net.minecraft.server.world.ChunkTicketType;
 import net.minecraft.server.world.ServerWorld;
+import net.minecraft.text.*;
 import net.minecraft.util.*;
 import net.minecraft.util.dynamic.Codecs;
 import net.minecraft.util.hit.HitResult;
@@ -585,7 +596,7 @@ public class Telebooks implements DedicatedServerModInitializer {
 
 	int nextTeleportSequenceID = 0;
 
-	private ActionResult handleLecternUse(ServerWorld world, BlockPos pos) {
+	private ActionResult handleLecternUse(PlayerEntity player, ServerWorld world, BlockPos pos, Integer targetIndex) {
 		var server = world.getServer();
 
 		// Requirement: teleport lecterns must have a book
@@ -601,6 +612,14 @@ public class Telebooks implements DedicatedServerModInitializer {
 		var pattern = tryGetBookPattern(world, center, forward);
 		if (pattern.isEmpty()) {
 			return ActionResult.PASS;
+		}
+
+		// Requirement: Player must be within the active area
+		{
+			var activeArea = new Box(center.up(2)).expand(1);
+			if (!activeArea.contains(player.getPos())) {
+				return ActionResult.FAIL;
+			}
 		}
 
 		// If so, locate corresponding book chain
@@ -622,6 +641,9 @@ public class Telebooks implements DedicatedServerModInitializer {
 			}
 
 			var siblingWorld = server.getWorld(loc.world);
+			if (siblingWorld == null) {
+				return false;
+			}
 
 			var siblingPattern = tryGetBookPattern(siblingWorld, loc.center, loc.forward);
 			if (siblingPattern.isEmpty()) {
@@ -648,14 +670,88 @@ public class Telebooks implements DedicatedServerModInitializer {
 			State.save(server);
 		}
 
+		// Interacting with the lectern while sneaking will bring up the destination chooser book
+		if (targetIndex == null && player.isSneaking()) {
+			var commandPrefix = String.format("/telebook_trigger %d %d %d ", pos.getX(), pos.getY(), pos.getZ());
+
+			// Create destination picker book contents
+			var bookItem = new ItemStack(Items.WRITTEN_BOOK);
+
+			var pages = new NbtList();
+
+			for (int siblingIndex = 0; siblingIndex < chain.books.size(); siblingIndex++) {
+				var loc = chain.books.get(siblingIndex);
+
+				var page = Text.empty();
+
+				page.append(loc.center.toShortString());
+				page.append("\n\n");
+
+				if (loc.equals(book)) {
+					page.append(Text.literal("(You are here)"));
+				} else {
+					int finalIndex = siblingIndex;
+					page.append(Text.literal("Teleport!").styled(style -> style
+						.withUnderline(true)
+						.withClickEvent(new ClickEvent(ClickEvent.Action.RUN_COMMAND, commandPrefix + finalIndex))
+					));
+				}
+
+				pages.add(NbtString.of(Text.Serialization.toJsonString(page)));
+			}
+
+			bookItem.setSubNbt(WrittenBookItem.TITLE_KEY, NbtString.of("Book"));
+			bookItem.setSubNbt(WrittenBookItem.AUTHOR_KEY, NbtString.of("System"));
+			bookItem.setSubNbt("pages", pages);
+
+			// Open a unique instance for the player with the destination picker
+			player.openHandledScreen(new NamedScreenHandlerFactory() {
+				@Override
+				public Text getDisplayName() {
+					return Text.empty();
+				}
+
+				@Override
+				public ScreenHandler createMenu(int syncId, PlayerInventory playerInventory, PlayerEntity player) {
+					var screenHandler = new LecternScreenHandler(syncId, new SimpleInventory(bookItem), new ArrayPropertyDelegate(1)) {
+						@Override
+						public boolean onButtonClick(PlayerEntity player, int id) {
+							if (id == LecternScreenHandler.TAKE_BOOK_BUTTON_ID) {
+								return false;
+							}
+
+							return super.onButtonClick(player, id);
+						}
+					};
+
+					// Open at the current location
+					screenHandler.setProperty(0, chain.books.indexOf(book));
+
+					return screenHandler;
+				}
+			});
+
+			return ActionResult.FAIL;
+		}
+
 		// Build sequence of books we should try to teleport to
-		var candidates = new ArrayList<>(chain.books);
-		{
+		var candidates = new ArrayList<BookLocation>();
+
+		if (targetIndex == null) {
+			candidates.addAll(chain.books);
+
 			// Rotate book list so that the current book is the first in the sequence
 			Collections.rotate(candidates, -candidates.indexOf(book));
 
 			// Pop current book
 			candidates.remove(0);
+		} else {
+			if (targetIndex < 0 || targetIndex >= chain.books.size()) {
+				return ActionResult.FAIL;
+			}
+
+			// Put only targeted book as a valid candidate
+			candidates.add(chain.books.get(targetIndex));
 		}
 
 		// Asynchronous teleportation sequence officially begins
@@ -727,7 +823,29 @@ public class Telebooks implements DedicatedServerModInitializer {
 				return ActionResult.PASS;
 			}
 
-			return handleLecternUse((ServerWorld) world, blockPos);
+			return handleLecternUse(player, (ServerWorld) world, blockPos, null);
+		});
+
+		CommandRegistrationCallback.EVENT.register((dispatcher, registry, environment) -> {
+			var cmd = CommandManager
+				.literal("telebook_trigger")
+				.requires(ServerCommandSource::isExecutedByPlayer)
+				.then(CommandManager.argument("lectern", BlockPosArgumentType.blockPos())
+				.then(CommandManager.argument("targetIndex", IntegerArgumentType.integer())
+				.executes(ctx -> {
+					var player = ctx.getSource().getPlayerOrThrow();
+					if (player.isSpectator()) {
+						return 0;
+					}
+
+					var pos = BlockPosArgumentType.getLoadedBlockPos(ctx, "lectern");
+					var index = IntegerArgumentType.getInteger(ctx, "targetIndex");
+
+					handleLecternUse(player, player.getServerWorld(), pos, index);
+					return 1;
+				})));
+
+			dispatcher.register(cmd);
 		});
 	}
 }
