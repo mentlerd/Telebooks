@@ -127,11 +127,7 @@ public class Telebooks implements DedicatedServerModInitializer {
 
 			var centerPos = center.toCenterPos();
 
-			// NB: -0.5 extension is to support dropped items
-			var entityBox = new Box(
-				centerPos.add(mins.getX(), mins.getY(), mins.getZ()).add(0, -0.5, 0),
-				centerPos.add(maxs.getX(), maxs.getY(), maxs.getZ())
-			);
+			var entityBox = new BookLocation(null, center, forward, Optional.empty()).activeArea();
 
 			var capturedEntities = new HashSet<Entity>();
 
@@ -446,6 +442,8 @@ public class Telebooks implements DedicatedServerModInitializer {
 			return new Box(center).offset(0, 1.5, 0).expand(1.45, 1.5, 1.45);
 		}
 
+		public Box activeArea() { return new Box(center).offset(0, 1.25, 0).expand(1, 1.25, 1); }
+
 		public boolean overlaps(BookLocation other) {
 			if (world != other.world) {
 				return false;
@@ -632,8 +630,8 @@ public class Telebooks implements DedicatedServerModInitializer {
 
 		// Requirement: Player must be within the active area
 		{
-			var activeArea = new Box(center.up(2)).expand(1);
-			if (!activeArea.contains(player.getPos())) {
+			var book = new BookLocation(world.getRegistryKey(), center, forward, Optional.empty());
+			if (!book.activeArea().contains(player.getPos())) {
 				return ActionResult.FAIL;
 			}
 		}
