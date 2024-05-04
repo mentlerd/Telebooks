@@ -11,6 +11,10 @@ import net.fabricmc.fabric.api.event.player.UseBlockCallback;
 import net.minecraft.block.*;
 import net.minecraft.block.entity.BlockEntityType;
 import net.minecraft.block.entity.SignBlockEntity;
+import net.minecraft.component.ComponentMap;
+import net.minecraft.component.DataComponentTypes;
+import net.minecraft.component.type.WritableBookContentComponent;
+import net.minecraft.component.type.WrittenBookContentComponent;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityType;
 import net.minecraft.entity.player.PlayerEntity;
@@ -22,6 +26,7 @@ import net.minecraft.item.WrittenBookItem;
 import net.minecraft.nbt.*;
 import net.minecraft.network.packet.s2c.play.PositionFlag;
 import net.minecraft.registry.RegistryKey;
+import net.minecraft.registry.RegistryWrapper;
 import net.minecraft.screen.*;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
@@ -66,7 +71,7 @@ public class Telebooks implements DedicatedServerModInitializer {
 	}
 
 	static class TeleportVolume {
-		record BlockInfo(Vec3i offset, BlockState state, NbtCompound blockEntityData) {}
+		record BlockInfo(Vec3i offset, BlockState state, NbtCompound nbt, ComponentMap components) {}
 		record EntityInfo(Vec3d offset, float yaw, EntityType<?> type, NbtCompound entityData) {}
 		record PlayerInfo(Vec3d offset, float yaw, PlayerEntity player) {}
 
@@ -209,14 +214,15 @@ public class Telebooks implements DedicatedServerModInitializer {
 
 				world.setBlockState(pos, info.state.rotate(rotation), Block.NOTIFY_LISTENERS);
 
-				if (info.blockEntityData != null) {
+				if (info.components != null) {
 					var blockEntity = world.getBlockEntity(pos);
 					if (blockEntity == null) {
 						LOGGER.warn("Copied block has no block entity?! {}", pos);
 						continue;
 					}
 
-					blockEntity.readNbt(info.blockEntityData);
+					blockEntity.readComponentlessNbt(info.nbt, world.getRegistryManager());
+					blockEntity.setComponents(info.components);
 					blockEntity.markDirty();
 				}
 			}
@@ -486,7 +492,7 @@ public class Telebooks implements DedicatedServerModInitializer {
 	}
 
 	static class State extends PersistentState {
-		private static final Type<State> type = new Type<>(State::new, nbt -> {
+		private static final Type<State> type = new Type<>(State::new, (nbt, lookup) -> {
 			var value = new State();
 			value.readNbt(nbt);
 			return value;
@@ -526,7 +532,7 @@ public class Telebooks implements DedicatedServerModInitializer {
 		}
 
 		@Override
-		public NbtCompound writeNbt(NbtCompound nbt) {
+		public NbtCompound writeNbt(NbtCompound nbt, RegistryWrapper.WrapperLookup lookup) {
 			var database = new Database();
 
             database.books.addAll(books.values());
@@ -731,7 +737,7 @@ public class Telebooks implements DedicatedServerModInitializer {
 			// Create destination picker book contents
 			var bookItem = new ItemStack(Items.WRITTEN_BOOK);
 
-			var pages = new NbtList();
+			var pages = new ArrayList<RawFilteredPair<Text>>();
 
 			int siblingCount = chain.books.size();
 
@@ -754,12 +760,12 @@ public class Telebooks implements DedicatedServerModInitializer {
 					));
 				}
 
-				pages.add(NbtString.of(Text.Serialization.toJsonString(page)));
+				pages.add(RawFilteredPair.of(page));
 			}
 
-			bookItem.setSubNbt(WrittenBookItem.TITLE_KEY, NbtString.of("Book"));
-			bookItem.setSubNbt(WrittenBookItem.AUTHOR_KEY, NbtString.of("System"));
-			bookItem.setSubNbt("pages", pages);
+			bookItem.set(DataComponentTypes.WRITTEN_BOOK_CONTENT, new WrittenBookContentComponent(
+				RawFilteredPair.of("Book"), "System", 0, pages, true
+			));
 
 			// Open a unique instance for the player with the destination picker
 			player.openHandledScreen(new NamedScreenHandlerFactory() {
