@@ -2,7 +2,10 @@ package com.mentlerd;
 
 import com.google.common.base.Predicates;
 import com.mentlerd.mixin.ServerChunkManagerAccessor;
+import com.mojang.datafixers.util.Pair;
 import com.mojang.serialization.Codec;
+import com.mojang.serialization.DataResult;
+import com.mojang.serialization.DynamicOps;
 import com.mojang.serialization.codecs.RecordCodecBuilder;
 import net.fabricmc.api.DedicatedServerModInitializer;
 
@@ -13,25 +16,24 @@ import net.minecraft.block.entity.BlockEntityType;
 import net.minecraft.block.entity.SignBlockEntity;
 import net.minecraft.component.ComponentMap;
 import net.minecraft.component.DataComponentTypes;
-import net.minecraft.component.type.WritableBookContentComponent;
 import net.minecraft.component.type.WrittenBookContentComponent;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityType;
+import net.minecraft.entity.SpawnReason;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.inventory.SimpleInventory;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
-import net.minecraft.item.WrittenBookItem;
 import net.minecraft.nbt.*;
 import net.minecraft.network.packet.s2c.play.PositionFlag;
 import net.minecraft.registry.RegistryKey;
-import net.minecraft.registry.RegistryWrapper;
 import net.minecraft.screen.*;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.server.world.ChunkTicketType;
 import net.minecraft.server.world.ServerWorld;
+import net.minecraft.storage.NbtWriteView;
 import net.minecraft.text.*;
 import net.minecraft.util.*;
 import net.minecraft.util.dynamic.Codecs;
@@ -75,7 +77,6 @@ public class Telebooks implements DedicatedServerModInitializer {
 		record EntityInfo(Vec3d offset, float yaw, EntityType<?> type, NbtCompound entityData) {}
 		record PlayerInfo(Vec3d offset, float yaw, PlayerEntity player) {}
 
-		private final ArrayList<BlockInfo> blocks = new ArrayList<>();
 		private final ArrayList<EntityInfo> entities = new ArrayList<>();
 		private final ArrayList<PlayerInfo> players = new ArrayList<>();
 
@@ -100,36 +101,6 @@ public class Telebooks implements DedicatedServerModInitializer {
 				case NORTH -> BlockRotation.CLOCKWISE_90;
 			};
 
-			// Tweak: Don't teleport blocks for now
-			/*
-			for (int offX = mins.getX(); offX <= maxs.getX(); offX++) {
-				for (int offY = mins.getY(); offY <= maxs.getY(); offY++) {
-					for (int offZ = mins.getZ(); offZ <= maxs.getZ(); offZ++) {
-						var pos = center
-								.offset(forward, offX)
-								.offset(Direction.UP, offY)
-								.offset(right, offZ);
-
-						var offset = new Vec3i(offX, offY, offZ);
-						var state = world.getBlockState(pos).rotate(rotation);
-
-						NbtCompound blockEntityData = null;
-
-						var blockEntity = world.getBlockEntity(pos);
-						if (blockEntity != null) {
-							blockEntityData = blockEntity.createNbt();
-
-							// Clear inventories of block entities before changing them
-							//  to air, otherwise they would drop their contents
-							Clearable.clear(blockEntity);
-						}
-
-						blocks.add(new BlockInfo(offset, state, blockEntityData));
-					}
-				}
-			}
-			*/
-
 			var centerPos = center.toCenterPos();
 
 			var entityBox = new BookLocation(null, center, forward, Optional.empty()).activeArea();
@@ -137,7 +108,7 @@ public class Telebooks implements DedicatedServerModInitializer {
 			var capturedEntities = new HashSet<Entity>();
 
 			for (var entity : world.getNonSpectatingEntities(Entity.class, entityBox)) {
-				var offset = rotateOffset(entity.getPos().subtract(centerPos), rotation);
+				var offset = rotateOffset(entity.getEntityPos().subtract(centerPos), rotation);
 				var yaw = rotateYaw(entity.getYaw(), rotation);
 
 				// Players are an exception, they are truly transferred instead of being copied
@@ -177,14 +148,14 @@ public class Telebooks implements DedicatedServerModInitializer {
 					continue;
 				}
 
-				var entityData = new NbtCompound();
+				var writer = NbtWriteView.create(ErrorReporter.EMPTY);
 
-				if (!entity.saveNbt(entityData)) {
+				if (!entity.saveData(writer)) {
 					LOGGER.error("Failed to serialize entity");
 					continue;
 				}
 
-				entities.add(new EntityInfo(offset, yaw, entity.getType(), entityData));
+				entities.add(new EntityInfo(offset, yaw, entity.getType(), writer.getNbt()));
 
 				entity.streamSelfAndPassengers().filter(Predicate.not(Entity::isPlayer)).forEach(capturedEntities::add);
 			}
@@ -204,29 +175,6 @@ public class Telebooks implements DedicatedServerModInitializer {
 				case NORTH -> BlockRotation.COUNTERCLOCKWISE_90;
 			};
 
-			for (var info : blocks) {
-				var pos = center
-						.offset(forward, info.offset.getX())
-						.offset(Direction.UP, info.offset.getY())
-						.offset(right, info.offset.getZ());
-
-				Clearable.clear(world.getBlockEntity(pos));
-
-				world.setBlockState(pos, info.state.rotate(rotation), Block.NOTIFY_LISTENERS);
-
-				if (info.components != null) {
-					var blockEntity = world.getBlockEntity(pos);
-					if (blockEntity == null) {
-						LOGGER.warn("Copied block has no block entity?! {}", pos);
-						continue;
-					}
-
-					blockEntity.readComponentlessNbt(info.nbt, world.getRegistryManager());
-					blockEntity.setComponents(info.components);
-					blockEntity.markDirty();
-				}
-			}
-
 			var loadedEntities = new HashMap<UUID, Entity>();
 			var centerPos = center.toCenterPos();
 
@@ -241,7 +189,7 @@ public class Telebooks implements DedicatedServerModInitializer {
 				var spawnData = info.entityData.copy();
 				spawnData.put("Pos", posList);
 
-				var entity = EntityType.loadEntityWithPassengers(spawnData, world, loaded -> {
+				var entity = EntityType.loadEntityWithPassengers(spawnData, world, SpawnReason.DIMENSION_TRAVEL,loaded -> {
 					loadedEntities.put(loaded.getUuid(), loaded);
 					return loaded;
 				});
@@ -273,7 +221,7 @@ public class Telebooks implements DedicatedServerModInitializer {
 				}
 
 				player.dismountVehicle();
-				player.teleport(world, pos.x, pos.y, pos.z, playerPosFlags, yaw, player.getPitch());
+				player.teleport(world, pos.x, pos.y, pos.z, playerPosFlags, yaw, player.getPitch(), false);
 
 				// NB: This is here to trigger a resync of the player experience level
 				player.addExperience(0);
@@ -300,7 +248,7 @@ public class Telebooks implements DedicatedServerModInitializer {
 				}
 
 				passengersWithPlayers.forEach(Entity::dismountVehicle);
-				passengersWithPlayers.forEach(passenger -> passenger.startRiding(vehicle, true));
+				passengersWithPlayers.forEach(passenger -> passenger.startRiding(vehicle, true, false));
 			}
 		}
 	}
@@ -404,7 +352,7 @@ public class Telebooks implements DedicatedServerModInitializer {
 				var state = world.getBlockState(pos);
 
 				// Requirement: patterns must be made of solid blocks
-				if (!state.isOpaqueFullCube(world, pos) && !state.isFullCube(world, pos)) {
+				if (!state.isOpaqueFullCube() && !state.isFullCube(world, pos)) {
 					return Optional.empty();
 				}
 
@@ -461,7 +409,7 @@ public class Telebooks implements DedicatedServerModInitializer {
 	record BookChain(int id, List<BlockState> pattern, List<BookLocation> books) {
 		static final Codec<BookChain> CODEC = RecordCodecBuilder.create(instance ->
 				instance.group(
-						Codecs.NONNEGATIVE_INT.fieldOf("id").forGetter(BookChain::id),
+						Codecs.NON_NEGATIVE_INT.fieldOf("id").forGetter(BookChain::id),
 						BlockState.CODEC.listOf().fieldOf("pattern").forGetter(BookChain::pattern),
 						BookLocation.CODEC.listOf().fieldOf("books").forGetter(BookChain::books)
 				).apply(instance, BookChain::new)
@@ -492,23 +440,35 @@ public class Telebooks implements DedicatedServerModInitializer {
 	}
 
 	static class State extends PersistentState {
-		private static final Type<State> type = new Type<>(State::new, (nbt, lookup) -> {
-			var value = new State();
-			value.readNbt(nbt);
-			return value;
-		}, null);
+		private static final Codec<State> CODEC = new Codec<>() {
+			@Override
+			public <T> DataResult<Pair<State, T>> decode(DynamicOps<T> ops, T input) {
+				return Database.CODEC.decode(ops, input).map(pair -> {
+					var state = new State();
+					state.load(pair.getFirst());
+					return Pair.of(state, pair.getSecond());
+				});
+			}
+
+			@Override
+			public <T> DataResult<T> encode(State input, DynamicOps<T> ops, T prefix) {
+				return Database.CODEC.encode(input.save(), ops, prefix);
+			}
+		};
+
+		private static final PersistentStateType<State> TYPE = new PersistentStateType<>(MOD_ID, State::new, CODEC, null);
 
 		private static PersistentStateManager getHost(MinecraftServer server) {
 			return Objects.requireNonNull(server.getWorld(World.OVERWORLD)).getPersistentStateManager();
 		}
 
 		public static State get(MinecraftServer server) {
-			return getHost(server).getOrCreate(type, MOD_ID);
+			return getHost(server).getOrCreate(TYPE);
 		}
 		public static void save(MinecraftServer server) {
 			var host = getHost(server);
 
-			host.getOrCreate(type, MOD_ID).markDirty();
+			host.getOrCreate(TYPE).markDirty();
 			host.save();
 		}
 
@@ -517,9 +477,7 @@ public class Telebooks implements DedicatedServerModInitializer {
 		final HashMap<Integer, BookChain> books = new HashMap<>();
 		final HashMap<List<BlockState>, Integer> patternToBook = new HashMap<>();
 
-		public void readNbt(NbtCompound nbt) {
-			var database = Database.CODEC.parse(NbtOps.INSTANCE, nbt).resultOrPartial(LOGGER::error).orElseThrow();
-
+		void load(Database database) {
 			nextChainID = 0;
 			books.clear();
 			patternToBook.clear();
@@ -530,14 +488,11 @@ public class Telebooks implements DedicatedServerModInitializer {
 				patternToBook.put(book.pattern, book.id);
 			}
 		}
-
-		@Override
-		public NbtCompound writeNbt(NbtCompound nbt, RegistryWrapper.WrapperLookup lookup) {
+		Database save() {
 			var database = new Database();
+			database.books.addAll(books.values());
 
-            database.books.addAll(books.values());
-
-			return (NbtCompound) Database.CODEC.encodeStart(NbtOps.INSTANCE, database).resultOrPartial(LOGGER::error).orElseThrow();
+			return database;
 		}
 
 		public BookChain getOrCreateBookChain(List<BlockState> pattern) {
@@ -556,10 +511,12 @@ public class Telebooks implements DedicatedServerModInitializer {
 		}
 	}
 
-	static ChunkTicketType<Integer> TELEBOOK_FORCE = ChunkTicketType.create("telebook.force", Integer::compareTo);
-	static ChunkTicketType<Integer> TELEBOOK_POST_LOAD = ChunkTicketType.create("telebook.force", Integer::compareTo, 20);
-
-	int nextChunkTicketID = 0;
+	// TODO: These used to be bespoke chunk tickets but the API to register them has gone private..
+	// These replacements look like close enough for the previous ones, but I am not sure whether
+	// it breaks anything in the base game, especially given that there doesn't seem to be a way
+	// to cancel a _specific_ set of tickets :/
+	static ChunkTicketType TELEBOOK_FORCE = ChunkTicketType.PLAYER_LOADING;
+	static ChunkTicketType TELEBOOK_POST_LOAD = ChunkTicketType.PLAYER_SPAWN;
 
 	private CompletableFuture<BookLocation> asyncChunkLoad(ServerWorld world, BookLocation loc) {
 		var manager = world.getChunkManager();
@@ -585,11 +542,10 @@ public class Telebooks implements DedicatedServerModInitializer {
 
 		// Initiate chunk loading, capture futures
 		var chunkFutures = new ArrayList<CompletableFuture<?>>();
-		var ticketID = nextChunkTicketID++;
 
 		for (var chunkPos : chunks) {
 			// Make sure loaded chunks remain in memory, even if their arrival is spread across multiple server ticks.
-			manager.addTicket(TELEBOOK_FORCE, chunkPos, 1, ticketID);
+			manager.addTicket(TELEBOOK_FORCE, chunkPos, 1);
 
 			// Invoke internal method which does _not_ pump server events until the chunk loading is complete.
 			chunkFutures.add(accessor.invokeGetChunkFuture(chunkPos.x, chunkPos.z, ChunkStatus.FULL, true));
@@ -599,12 +555,12 @@ public class Telebooks implements DedicatedServerModInitializer {
 		var chunksLoaded = CompletableFuture.allOf(chunkFutures.toArray(new CompletableFuture[0]));
 
 		var ticketsUpdated = chunksLoaded.handle((nothing, error) -> {
-			// Loading either complete, or something went awry - replace permanent tickets with permanent ones
+			// Loading either complete, or something went awry - replace permanent tickets with temporary ones
 			for (var chunkPos : chunks) {
-				manager.removeTicket(TELEBOOK_FORCE, chunkPos, 1, ticketID);
+				manager.removeTicket(TELEBOOK_FORCE, chunkPos, 1);
 
 				if (error == null) {
-					manager.addTicket(TELEBOOK_POST_LOAD, chunkPos, 1, ticketID);
+					manager.addTicket(TELEBOOK_POST_LOAD, chunkPos, 1);
 				}
 			}
 
@@ -637,7 +593,7 @@ public class Telebooks implements DedicatedServerModInitializer {
 		// Requirement: Player must be within the active area
 		{
 			var book = new BookLocation(world.getRegistryKey(), center, forward, Optional.empty());
-			if (!book.activeArea().contains(player.getPos())) {
+			if (!book.activeArea().contains(player.getEntityPos())) {
 				return ActionResult.FAIL;
 			}
 		}
@@ -752,11 +708,11 @@ public class Telebooks implements DedicatedServerModInitializer {
 				if (loc.equals(book)) {
 					page.append(Text.literal("(You are here)"));
 				} else {
-					var pageIndex = Integer.toString((siblingIndex + 1) % siblingCount + 1);
+					var pageIndex = (siblingIndex + 1) % siblingCount + 1;
 
 					page.append(Text.literal("Teleport!").styled(style -> style
 						.withUnderline(true)
-						.withClickEvent(new ClickEvent(ClickEvent.Action.CHANGE_PAGE, pageIndex))
+						.withClickEvent(new ClickEvent.ChangePage(pageIndex))
 					));
 				}
 
